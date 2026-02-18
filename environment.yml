@@ -1,0 +1,10 @@
+name: jlc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - astropy
+  - matplotlib
+  - pip
