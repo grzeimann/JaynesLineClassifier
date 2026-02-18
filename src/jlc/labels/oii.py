@@ -4,6 +4,9 @@ from .base import LabelModel
 from jlc.types import EvidenceResult
 from jlc.population.schechter import SchechterLF
 
+# Cosmology returns d_L in Mpc; convert to cm for L = 4π d_L^2 F in CGS.
+MPC_TO_CM = 3.085677581491367e24
+
 
 class OIILabel(LabelModel):
     label = "oii"
@@ -24,8 +27,9 @@ class OIILabel(LabelModel):
         F_grid, log_w = ctx.caches["flux_grid"].grid(row)
 
         # 3) prior density for each grid point (LF × volume × selection)
-        dL = ctx.cosmo.luminosity_distance(z)
-        L_grid = 4 * np.pi * (dL ** 2) * F_grid
+        dL = ctx.cosmo.luminosity_distance(z)  # Mpc
+        # Convert to cm before forming luminosity (LF expects L in erg/s)
+        L_grid = 4 * np.pi * ((dL * MPC_TO_CM) ** 2) * F_grid
 
         log_phi = np.log(self.lf.phi(L_grid) + 1e-300)
         log_dV = np.log(ctx.cosmo.dV_dz(z) + 1e-300)
