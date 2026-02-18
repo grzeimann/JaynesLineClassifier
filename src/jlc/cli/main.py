@@ -1,5 +1,6 @@
 import argparse
 import sys
+import numpy as np
 import pandas as pd
 
 from jlc.types import SharedContext
@@ -17,14 +18,19 @@ from jlc.simulate.simple import SkyBox, simulate_catalog, plot_distributions
 from jlc.simulate import simulate_catalog_from_model
 
 
-def build_default_context_and_registry(f_lim: float | None = None):
+def build_default_context_and_registry(f_lim: float | None = None, wave_min: float | None = None, wave_max: float | None = None):
     # Context with simple caches
     cosmo = AstropyCosmology()
     selection = SelectionModel(f_lim=f_lim)
     caches = {
         "flux_grid": FluxGrid(),
     }
-    ctx = SharedContext(cosmo=cosmo, selection=selection, caches=caches, config={"f_lim": f_lim})
+    config = {"f_lim": f_lim}
+    if wave_min is not None:
+        config["wave_min"] = float(wave_min)
+    if wave_max is not None:
+        config["wave_max"] = float(wave_max)
+    ctx = SharedContext(cosmo=cosmo, selection=selection, caches=caches, config=config)
 
     # Default Schechter parameters (placeholder values)
     # Apply conservative luminosity bounds to keep PPP rates finite.
@@ -40,7 +46,8 @@ def build_default_context_and_registry(f_lim: float | None = None):
 
     lae = LAELabel(lae_lf, selection, [flux_meas])
     oii = OIILabel(oii_lf, selection, [flux_meas])
-    fake = FakeLabel()
+    # Tie Fake label to selection and measurement, consistent with simulator
+    fake = FakeLabel(selection_model=selection, measurement_modules=[flux_meas])
 
     registry = LabelRegistry([lae, oii, fake])
     return ctx, registry
@@ -62,7 +69,7 @@ def cmd_simulate(args) -> int:
 
     if args.from_model:
         # Build context/registry first for model-driven PPP
-        ctx, registry = build_default_context_and_registry(f_lim=args.f_lim)
+        ctx, registry = build_default_context_and_registry(f_lim=args.f_lim, wave_min=args.wave_min, wave_max=args.wave_max)
         df = simulate_catalog_from_model(
             ctx=ctx,
             registry=registry,
@@ -91,16 +98,23 @@ def cmd_simulate(args) -> int:
             flux_err=args.flux_err,
             seed=args.seed,
         )
+        # Build a fresh context/registry for classification
+        ctx, registry = build_default_context_and_registry(f_lim=args.f_lim, wave_min=args.wave_min, wave_max=args.wave_max)
 
     # Save simulated catalog
     if args.out_catalog:
         df.to_csv(args.out_catalog, index=False)
 
-    # Classify with selection model using same f_lim
-    ctx, registry = build_default_context_and_registry(f_lim=args.f_lim)
+    # Classify using the same context/registry (PPP path reuses them)
     engine = JaynesianEngine(registry, ctx)
     out = engine.compute_log_evidence_matrix(df)
-    out = engine.normalize_posteriors(out)
+    # Use PPP expected counts as priors if available
+    log_prior_weights = None
+    if isinstance(getattr(ctx, "config", None), dict) and "ppp_expected_counts" in ctx.config:
+        mu = ctx.config["ppp_expected_counts"]
+        # Ensure only known labels and positive counts contribute
+        log_prior_weights = {L: (np.log(max(mu.get(L, 0.0), 1e-300))) for L in registry.labels}
+    out = engine.normalize_posteriors(out, log_prior_weights=log_prior_weights)
     if args.out_classified:
         out.to_csv(args.out_classified, index=False)
 

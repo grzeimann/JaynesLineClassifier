@@ -300,6 +300,13 @@ def simulate_catalog_from_model(
 
     # Concatenate all
     if len(classes) == 0:
+        # Expose expected counts and volumes in context for downstream use
+        try:
+            if hasattr(ctx, "config") and isinstance(ctx.config, dict):
+                ctx.config["ppp_expected_counts"] = dict(exp_counts)
+                ctx.config["ppp_label_volumes"] = dict(label_volumes)
+        except Exception:
+            pass
         # Print expectations even if no objects realized
         try:
             lae_mu = exp_counts.get("lae", 0.0)
@@ -329,6 +336,14 @@ def simulate_catalog_from_model(
         "flux_hat": Fhat_all,
         "flux_err": Ferr_all,
     })
+
+    # Expose expected counts and volumes in context for downstream use
+    try:
+        if hasattr(ctx, "config") and isinstance(ctx.config, dict):
+            ctx.config["ppp_expected_counts"] = dict(exp_counts)
+            ctx.config["ppp_label_volumes"] = dict(label_volumes)
+    except Exception:
+        pass
 
     # Print expectations summary
     try:

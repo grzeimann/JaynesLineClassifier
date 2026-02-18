@@ -29,15 +29,21 @@ class LAELabel(LabelModel):
         # 3) prior density for each grid point (LF × volume × selection)
         dL = ctx.cosmo.luminosity_distance(z)  # Mpc
         # Convert to cm before forming luminosity (LF expects L in erg/s)
-        L_grid = 4 * np.pi * ((dL * MPC_TO_CM) ** 2) * F_grid
+        dL_cm = dL * MPC_TO_CM
+        L_grid = 4 * np.pi * (dL_cm ** 2) * F_grid
+
+        # Include Jacobian from luminosity to flux: dL/dF = 4π d_L^2 (in cgs)
+        dLdF = 4 * np.pi * (dL_cm ** 2)
 
         log_phi = np.log(self.lf.phi(L_grid) + 1e-300)
         log_dV = np.log(ctx.cosmo.dV_dz(z) + 1e-300)
         log_sel = np.log(self.selection.completeness(F_grid, float(row.get("wave_obs", np.nan))) + 1e-300)
+        log_dLdF = np.log(dLdF + 1e-300)
 
         log_jac = -np.log(self.rest_wave)  # |dz/dlambda|
 
-        log_prior = log_phi + log_dV + log_sel + log_jac
+        # Prior over flux: phi(L) dL/dF × dV/dz × S × |dz/dλ|
+        log_prior = log_phi + log_dLdF + log_dV + log_sel + log_jac
 
         # 4) measurement likelihoods for each grid point
         log_like = np.zeros_like(F_grid)
