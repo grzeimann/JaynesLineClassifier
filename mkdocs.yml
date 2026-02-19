@@ -1,0 +1,31 @@
+site_name: JaynesLineClassifier Documentation
+site_description: Documentation for the Jaynesian Line Classifier (JLC)
+site_url: 
+repo_url: 
+repo_name: JaynesLineClassifier
+edit_uri: 
+docs_dir: docs
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - User Guide:
+      - CLI Usage: user-guide/cli.md
+      - Configuration: user-guide/configuration.md
+      - Examples: user-guide/examples.md
+  - Algorithms: algorithms/overview.md
+  - Data Products: data-products/overview.md
+  - API: api/index.md
+  - Community:
+      - Contributing: community/contributing.md
+      - Code of Conduct: community/code_of_conduct.md
+  - Release Info:
+      - Changelog: release_info/changelog.md
+  - Citation: citation/citation.md
+  - Development: development/dev-quickstart.md
+
+# Default MkDocs theme works without extra plugins
+# theme:
+#   name: mkdocs
