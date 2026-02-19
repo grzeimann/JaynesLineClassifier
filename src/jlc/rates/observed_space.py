@@ -18,6 +18,54 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+def calibrate_fake_rate_from_catalog(df: Any, ra_low: float, ra_high: float, dec_low: float, dec_high: float,
+                                     wave_min: float, wave_max: float) -> float:
+    """
+    Estimate a homogeneous fake rate density ρ (per sr per Å) from a virtual catalog.
+
+    Minimal estimator:
+      ρ̂ = N / (Ω · Δλ)
+    where N is the number of rows with wave_obs within [wave_min, wave_max],
+    Ω is the solid angle of the rectangular sky box, and Δλ = wave_max − wave_min.
+
+    Parameters
+    ----------
+    df : DataFrame-like (must support df.get("wave_obs").values)
+    ra_low, ra_high, dec_low, dec_high : float
+        Sky box bounds in degrees.
+    wave_min, wave_max : float
+        Wavelength band in Å.
+
+    Returns
+    -------
+    float
+        Estimated ρ̂ in units of 1/(sr·Å). Returns 0.0 if inputs invalid.
+    """
+    try:
+        import numpy as _np
+        from jlc.simulate.model_ppp import skybox_solid_angle_sr as _omega
+        lam = _np.asarray(df.get("wave_obs")).astype(float)
+        if lam.size == 0:
+            return 0.0
+        wmin = float(wave_min)
+        wmax = float(wave_max)
+        if not (_np.isfinite(wmin) and _np.isfinite(wmax)) or wmax <= wmin:
+            return 0.0
+        sel = _np.isfinite(lam) & (lam >= wmin) & (lam <= wmax)
+        N = int(_np.sum(sel))
+        Omega = float(_omega(ra_low, ra_high, dec_low, dec_high))
+        Omega = max(Omega, 0.0)
+        Dlam = float(wmax - wmin)
+        if Omega <= 0.0 or Dlam <= 0.0:
+            return 0.0
+        rho_hat = float(N) / (Omega * Dlam)
+        if not _np.isfinite(rho_hat) or rho_hat < 0:
+            return 0.0
+        return float(rho_hat)
+    except Exception:
+        return 0.0
+
+
 def effective_search_measure(row: Any, ctx: Any) -> float:
     """
     Return the effective search measure multiplier to convert per-(sr·Å·flux)

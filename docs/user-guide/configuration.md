@@ -8,6 +8,11 @@ JLC pulls run-time configuration from CLI options and stores them in a shared co
 - `ppp_expected_counts`: dict of expected counts by label computed during PPP simulation; used as optional global prior weights when normalizing posteriors.
 - `ppp_label_volumes`: dict of per-label comoving volumes (Mpc^3) within the sky box and wavelength window.
 - `volume_mode`: `real` (default) or `virtual` (physical labels suppressed).
+- `fake_rate_per_sr_per_A`: fake rate density used by the Fake label’s rate prior (can be provided or calibrated).
+- `fake_rate_rho_used`: if present, the calibrated/used fake rate ρ (per sr per Å) recorded for traceability; also emitted as a `rho_used` column in outputs.
+- Posterior toggles:
+  - `use_rate_priors` (default True): if False, disables per-row rate priors (evidence-only posteriors).
+  - `use_global_priors` (default True): if False, ignores global prior weights (e.g., PPP expected counts) during normalization.
 - Effective search measure knobs (multiply all rates):
   - `n_fibers`, `ifu_count`, `exposure_scale`, `search_measure_scale`.
 

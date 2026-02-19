@@ -91,6 +91,13 @@ def cmd_classify(args) -> int:
             print(f"[jlc.classify] Warning: failed to load w_table from {args.w_table}: {e}")
             w_table = None
     ctx, registry = build_default_context_and_registry(F50=getattr(args, "F50", None), w=getattr(args, "w", None), F50_table=F50_table, w_table=w_table)
+    # Apply prior toggles to context config
+    try:
+        if isinstance(ctx.config, dict):
+            ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
+            ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
+    except Exception:
+        pass
     engine = JaynesianEngine(registry, ctx)
     out = engine.compute_log_evidence_matrix(df)
     out = engine.normalize_posteriors(out)
@@ -152,6 +159,24 @@ def cmd_simulate(args) -> int:
             fake_lambda_cache = None
 
     if args.from_model:
+        # Optional: calibrate a homogeneous fake rate ρ̂ from a virtual catalog
+        if getattr(args, "calibrate_fake_rate_from", None):
+            try:
+                calib_df = pd.read_csv(args.calibrate_fake_rate_from)
+                from jlc.rates.observed_space import calibrate_fake_rate_from_catalog
+                rho_hat = calibrate_fake_rate_from_catalog(
+                    calib_df,
+                    ra_low=args.ra_low, ra_high=args.ra_high,
+                    dec_low=args.dec_low, dec_high=args.dec_high,
+                    wave_min=args.wave_min, wave_max=args.wave_max,
+                )
+                if np.isfinite(rho_hat) and rho_hat > 0:
+                    print(f"[jlc.simulate] Calibrated fake rate ρ̂ ≈ {rho_hat:.6e} (1/(sr·Å)) from {args.calibrate_fake_rate_from}; overriding --fake-rate")
+                    args.fake_rate = float(rho_hat)
+                else:
+                    print("[jlc.simulate] Warning: calibrated fake rate was non-positive or invalid; keeping provided --fake-rate value")
+            except Exception as e:
+                print(f"[jlc.simulate] Warning: failed to calibrate fake rate from {args.calibrate_fake_rate_from}: {e}")
         # Build context/registry first for model-driven PPP
         ctx, registry = build_default_context_and_registry(
             f_lim=args.f_lim,
@@ -167,6 +192,13 @@ def cmd_simulate(args) -> int:
             F50_table=F50_table,
             w_table=w_table,
         )
+        # Apply prior toggles to context config
+        try:
+            if isinstance(ctx.config, dict):
+                ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
+                ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
+        except Exception:
+            pass
         # Attach empirical fake λ-PDF cache if available
         if fake_lambda_cache is not None:
             try:
@@ -177,6 +209,7 @@ def cmd_simulate(args) -> int:
         try:
             if isinstance(ctx.config, dict):
                 ctx.config["fake_rate_per_sr_per_A"] = float(args.fake_rate)
+                ctx.config["fake_rate_rho_used"] = float(args.fake_rate)
         except Exception:
             pass
         df = simulate_catalog_from_model(
@@ -222,6 +255,13 @@ def cmd_simulate(args) -> int:
             F50_table=F50_table,
             w_table=w_table,
         )
+        # Apply prior toggles to context config
+        try:
+            if isinstance(ctx.config, dict):
+                ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
+                ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
+        except Exception:
+            pass
         if fake_lambda_cache is not None:
             try:
                 ctx.caches["fake_lambda_pdf"] = fake_lambda_cache
@@ -263,6 +303,8 @@ def main(argv=None):
     p_classify.add_argument("--w", dest="w", type=float, default=None, help="Transition width for smooth tanh selection (requires F50)")
     p_classify.add_argument("--F50-table", dest="F50_table", default=None, help="Path to F50(λ) table (.npz or .csv with bin_left,value)")
     p_classify.add_argument("--w-table", dest="w_table", default=None, help="Path to w(λ) table (.npz or .csv with bin_left,value)")
+    p_classify.add_argument("--evidence-only", dest="evidence_only", action="store_true", help="Disable per-row rate priors; use evidences only for posteriors")
+    p_classify.add_argument("--no-global-priors", dest="no_global_priors", action="store_true", help="Do not use global prior weights (e.g., PPP expected counts)")
     p_classify.set_defaults(func=cmd_classify)
 
     p_sim = sub.add_parser("simulate", help="Generate a mock catalog and classify")
@@ -285,6 +327,7 @@ def main(argv=None):
     p_sim.add_argument("--fake-frac", dest="fake_frac", type=float, default=0.4)
     p_sim.add_argument("--from-model", dest="from_model", action="store_true", help="Use model-driven PPP simulation instead of simple fractions")
     p_sim.add_argument("--fake-rate", dest="fake_rate", type=float, default=0.0, help="Fake rate density per sr per Angstrom for PPP mode")
+    p_sim.add_argument("--calibrate-fake-rate-from", dest="calibrate_fake_rate_from", default=None, help="CSV of virtual detections to estimate a homogeneous fake rate ρ; uses current sky box and wavelength band")
     p_sim.add_argument("--nz", dest="nz", type=int, default=256, help="Number of redshift grid points for PPP mode")
     p_sim.add_argument("--volume-mode", dest="volume_mode", choices=["real", "virtual"], default="real", help="Volume mode: real (default) or virtual (no physical sources)")
     p_sim.add_argument("--fake-lambda-calib", dest="fake_lambda_calib", default=None, help="CSV with wave_obs from virtual detections to calibrate fake λ-PDF")
@@ -300,6 +343,9 @@ def main(argv=None):
     p_sim.add_argument("--out-catalog", dest="out_catalog", default="sim_catalog.csv")
     p_sim.add_argument("--out-classified", dest="out_classified", default="sim_classified.csv")
     p_sim.add_argument("--plot-prefix", dest="plot_prefix", default=None, help="If set, save distribution plots with this prefix")
+    # Posterior control toggles
+    p_sim.add_argument("--evidence-only", dest="evidence_only", action="store_true", help="Disable per-row rate priors; use evidences only for posteriors")
+    p_sim.add_argument("--no-global-priors", dest="no_global_priors", action="store_true", help="Do not use global prior weights (e.g., PPP expected counts)")
     p_sim.set_defaults(func=cmd_simulate)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])

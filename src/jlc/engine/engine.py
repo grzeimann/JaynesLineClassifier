@@ -21,7 +21,14 @@ class JaynesianEngine:
         out = df.copy()
         labels = self.registry.labels
 
+        # Config toggles
+        cfg = getattr(self.ctx, "config", {}) or {}
+        use_rate_priors = bool(cfg.get("use_rate_priors", True))
+        use_global_priors = bool(cfg.get("use_global_priors", True))
+
         # Optional global prior weights (e.g., PPP expected counts)
+        if not use_global_priors:
+            log_prior_weights = None
         logW = (
             np.array([log_prior_weights.get(L, 0.0) for L in labels], dtype=float)
             if log_prior_weights
@@ -61,6 +68,12 @@ class JaynesianEngine:
                 except Exception:
                     pass
 
+        # If evidence-only mode is requested, override rates with 1.0 (neutral prior)
+        if not use_rate_priors:
+            rates[:, :] = 1.0
+            # In evidence-only mode, per-component fake rate diagnostics are not meaningful; skip emitting them
+            expose_fake_components = False
+
         # Emit per-label rate diagnostics
         for j, L in enumerate(labels):
             out[f"rate_{L}"] = rates[:, j]
@@ -71,6 +84,13 @@ class JaynesianEngine:
                 out[col] = fake_components_matrix[:, cj]
 
         # Combine log rate prior with data evidence
+        # Optionally emit the global log prior weights used (one per label, same for all rows)
+        if log_prior_weights is not None and use_global_priors:
+            try:
+                for j, L in enumerate(labels):
+                    out[f"log_prior_weight_{L}"] = float(logW[j])
+            except Exception:
+                pass
         logZ = np.vstack([out[f"logZ_{L}"].values for L in labels]).T  # (N, K)
         with np.errstate(divide='ignore'):
             logR = np.log(rates + 1e-300)
@@ -99,5 +119,18 @@ class JaynesianEngine:
             out["prior_odds_phys_over_fake"] = prior_odds
         else:
             out["rate_phys_total"] = np.sum(rates, axis=1)
+
+        # Record which priors were applied
+        out["use_rate_priors"] = bool(use_rate_priors)
+        out["use_global_priors"] = bool(use_global_priors)
+
+        # If a calibrated/used fake rate is present in context, record it for traceability
+        try:
+            cfg = getattr(self.ctx, "config", {}) or {}
+            rho = cfg.get("fake_rate_rho_used", cfg.get("fake_rate_per_sr_per_A", None))
+            if rho is not None:
+                out["rho_used"] = float(rho)
+        except Exception:
+            pass
 
         return out

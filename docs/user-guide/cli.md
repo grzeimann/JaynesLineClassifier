@@ -16,6 +16,10 @@ Selection model options (optional):
 Example:
 - `jlc classify input.csv --out output.csv --F50 1.5e-17 --w 5e-18`
 
+Posterior control (diagnostics/ablation):
+- `--evidence-only`: disable per-row rate priors and use evidences only for posteriors.
+- `--no-global-priors`: ignore any global prior weights (e.g., PPP expected counts) during normalization.
+
 Outputs include per-label columns like `logZ_lae`, `logZ_oii`, `logZ_fake`, `p_lae`, `p_oii`, `p_fake`, plus diagnostics described below.
 
 ## jlc simulate
@@ -41,6 +45,7 @@ Two simulation modes are available:
 2) Model-driven PPP simulator
 - `--from-model`: enable PPP mode
 - `--fake-rate`: fake rate density per sr per Å (used in simulator and as Fake rate prior)
+- `--calibrate-fake-rate-from CSV`: estimate a homogeneous fake rate ρ̂ from a CSV of virtual detections using the current sky box and wavelength band; overrides `--fake-rate` when successful
 - `--nz`: redshift grid resolution (default 256)
 - `--volume-mode {real,virtual}`: virtual suppresses physical labels (fake-only)
 
@@ -72,4 +77,5 @@ Classification outputs include:
 - `p_<label>`: posterior after combining logZ with log(rate) and optional global priors
 - `rate_<label>`: observed-space rate density for each label at the row’s wavelength
 - `rate_phys_total`, `rate_fake_total`, `prior_odds_phys_over_fake`
+- `log_prior_weight_<label>`: if global prior weights are applied (e.g., PPP expected counts), the per-label log weight used (same across rows) is emitted for auditability.
 - If Fake mixture is enabled, per-component columns like `rate_fake_sky_residual`, `rate_fake_noise` summing to `rate_fake_total`.
