@@ -18,7 +18,9 @@ from jlc.simulate.simple import SkyBox, simulate_catalog, plot_distributions
 from jlc.simulate import simulate_catalog_from_model
 
 
-def build_default_context_and_registry(f_lim: float | None = None, wave_min: float | None = None, wave_max: float | None = None):
+def build_default_context_and_registry(f_lim: float | None = None, wave_min: float | None = None, wave_max: float | None = None, volume_mode: str | None = None,
+                                        n_fibers: int | None = None, ifu_count: int | None = None, exposure_scale: float | None = None,
+                                        search_measure_scale: float | None = None):
     # Context with simple caches
     cosmo = AstropyCosmology()
     selection = SelectionModel(f_lim=f_lim)
@@ -30,6 +32,17 @@ def build_default_context_and_registry(f_lim: float | None = None, wave_min: flo
         config["wave_min"] = float(wave_min)
     if wave_max is not None:
         config["wave_max"] = float(wave_max)
+    if volume_mode is not None:
+        config["volume_mode"] = str(volume_mode).lower()
+    # effective_search_measure knobs
+    if n_fibers is not None:
+        config["n_fibers"] = int(n_fibers)
+    if ifu_count is not None:
+        config["ifu_count"] = int(ifu_count)
+    if exposure_scale is not None:
+        config["exposure_scale"] = float(exposure_scale)
+    if search_measure_scale is not None:
+        config["search_measure_scale"] = float(search_measure_scale)
     ctx = SharedContext(cosmo=cosmo, selection=selection, caches=caches, config=config)
 
     # Default Schechter parameters (placeholder values)
@@ -67,9 +80,61 @@ def cmd_simulate(args) -> int:
     # Build sky
     sky = SkyBox(args.ra_low, args.ra_high, args.dec_low, args.dec_high)
 
+    # Optionally build empirical fake λ-PDF cache from calibration CSV
+    fake_lambda_cache = None
+    # Option 1: build from calibration CSV
+    if getattr(args, "fake_lambda_calib", None):
+        try:
+            calib_df = pd.read_csv(args.fake_lambda_calib)
+            from jlc.rates.observed_space import build_fake_lambda_pdf, save_fake_lambda_cache
+            fake_lambda_cache = build_fake_lambda_pdf(
+                calib_df.get("wave_obs", pd.Series(dtype=float)).values,
+                wave_min=args.wave_min,
+                wave_max=args.wave_max,
+                nbins=args.fake_lambda_nbins,
+            )
+            if getattr(args, "fake_lambda_cache_out", None):
+                try:
+                    save_fake_lambda_cache(args.fake_lambda_cache_out, fake_lambda_cache)
+                    print(f"[jlc.simulate] Saved fake λ-PDF cache to {args.fake_lambda_cache_out}")
+                except Exception as ee:
+                    print(f"[jlc.simulate] Warning: failed to save fake λ-PDF cache to {args.fake_lambda_cache_out}: {ee}")
+        except Exception as e:
+            print(f"[jlc.simulate] Warning: failed to build fake λ-PDF from {args.fake_lambda_calib}: {e}")
+            fake_lambda_cache = None
+    # Option 2: load from a precomputed cache file if not built above
+    if fake_lambda_cache is None and getattr(args, "fake_lambda_cache_in", None):
+        try:
+            from jlc.rates.observed_space import load_fake_lambda_cache
+            fake_lambda_cache = load_fake_lambda_cache(args.fake_lambda_cache_in)
+        except Exception as e:
+            print(f"[jlc.simulate] Warning: failed to load fake λ-PDF cache from {args.fake_lambda_cache_in}: {e}")
+            fake_lambda_cache = None
+
     if args.from_model:
         # Build context/registry first for model-driven PPP
-        ctx, registry = build_default_context_and_registry(f_lim=args.f_lim, wave_min=args.wave_min, wave_max=args.wave_max)
+        ctx, registry = build_default_context_and_registry(
+            f_lim=args.f_lim,
+            wave_min=args.wave_min,
+            wave_max=args.wave_max,
+            volume_mode=args.volume_mode,
+            n_fibers=getattr(args, "n_fibers", None),
+            ifu_count=getattr(args, "ifu_count", None),
+            exposure_scale=getattr(args, "exposure_scale", None),
+            search_measure_scale=getattr(args, "search_measure_scale", None),
+        )
+        # Attach empirical fake λ-PDF cache if available
+        if fake_lambda_cache is not None:
+            try:
+                ctx.caches["fake_lambda_pdf"] = fake_lambda_cache
+            except Exception:
+                pass
+        # Propagate fake rate into context config for rate-density prior use
+        try:
+            if isinstance(ctx.config, dict):
+                ctx.config["fake_rate_per_sr_per_A"] = float(args.fake_rate)
+        except Exception:
+            pass
         df = simulate_catalog_from_model(
             ctx=ctx,
             registry=registry,
@@ -99,7 +164,21 @@ def cmd_simulate(args) -> int:
             seed=args.seed,
         )
         # Build a fresh context/registry for classification
-        ctx, registry = build_default_context_and_registry(f_lim=args.f_lim, wave_min=args.wave_min, wave_max=args.wave_max)
+        ctx, registry = build_default_context_and_registry(
+            f_lim=args.f_lim,
+            wave_min=args.wave_min,
+            wave_max=args.wave_max,
+            volume_mode=args.volume_mode,
+            n_fibers=getattr(args, "n_fibers", None),
+            ifu_count=getattr(args, "ifu_count", None),
+            exposure_scale=getattr(args, "exposure_scale", None),
+            search_measure_scale=getattr(args, "search_measure_scale", None),
+        )
+        if fake_lambda_cache is not None:
+            try:
+                ctx.caches["fake_lambda_pdf"] = fake_lambda_cache
+            except Exception:
+                pass
 
     # Save simulated catalog
     if args.out_catalog:
@@ -149,6 +228,16 @@ def main(argv=None):
     p_sim.add_argument("--from-model", dest="from_model", action="store_true", help="Use model-driven PPP simulation instead of simple fractions")
     p_sim.add_argument("--fake-rate", dest="fake_rate", type=float, default=0.0, help="Fake rate density per sr per Angstrom for PPP mode")
     p_sim.add_argument("--nz", dest="nz", type=int, default=256, help="Number of redshift grid points for PPP mode")
+    p_sim.add_argument("--volume-mode", dest="volume_mode", choices=["real", "virtual"], default="real", help="Volume mode: real (default) or virtual (no physical sources)")
+    p_sim.add_argument("--fake-lambda-calib", dest="fake_lambda_calib", default=None, help="CSV with wave_obs from virtual detections to calibrate fake λ-PDF")
+    p_sim.add_argument("--fake-lambda-nbins", dest="fake_lambda_nbins", type=int, default=200, help="Number of bins for fake λ-PDF calibration")
+    p_sim.add_argument("--fake-lambda-cache-in", dest="fake_lambda_cache_in", default=None, help="Path to load a precomputed fake λ-PDF cache (.npz)")
+    p_sim.add_argument("--fake-lambda-cache-out", dest="fake_lambda_cache_out", default=None, help="If provided and a cache is built, save it to this path (.npz)")
+    # effective_search_measure knobs
+    p_sim.add_argument("--n-fibers", dest="n_fibers", type=int, default=None, help="Number of fibers contributing to search (multiplier)")
+    p_sim.add_argument("--ifu-count", dest="ifu_count", type=int, default=None, help="Number of IFUs contributing (multiplier)")
+    p_sim.add_argument("--exposure-scale", dest="exposure_scale", type=float, default=None, help="Relative exposure/time scale (multiplier)")
+    p_sim.add_argument("--search-measure-scale", dest="search_measure_scale", type=float, default=None, help="Additional scalar multiplier for effective_search_measure")
     p_sim.add_argument("--seed", dest="seed", type=int, default=12345)
     p_sim.add_argument("--out-catalog", dest="out_catalog", default="sim_catalog.csv")
     p_sim.add_argument("--out-classified", dest="out_classified", default="sim_classified.csv")

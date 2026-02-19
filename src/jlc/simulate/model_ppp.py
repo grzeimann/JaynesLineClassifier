@@ -190,7 +190,15 @@ def simulate_catalog_from_model(
     # Loop over labels in registry
     for label_name in registry.labels:
         model = registry.model(label_name)
-        if label_name == "fake":
+        # In virtual volume mode, suppress physical labels entirely
+        try:
+            if str(getattr(ctx, "config", {}).get("volume_mode", "real")).lower() == "virtual" and label_name != "fake":
+                # still record zeros for expectations
+                exp_counts[label_name] = 0.0
+                continue
+        except Exception:
+            pass
+        if label_name == "fake": 
             # Fakes: homogeneous PPP in (sky, lambda)
             rho = max(float(fake_rate_per_sr_per_A), 0.0)
             mu = rho * omega * max(0.0, float(wave_max - wave_min))
