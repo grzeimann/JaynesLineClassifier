@@ -5,13 +5,16 @@ The `jlc` CLI provides two primary commands: `classify` and `simulate`.
 ## jlc classify
 
 Classify a catalog CSV and write an output CSV with evidences, posterior probabilities, and rate diagnostics.
-
 Required columns in input CSV:
 - `wave_obs` (Å), `flux_hat` (flux units), `flux_err` (same units as flux_hat)
 - Optional: `ra`, `dec` for reference
 
+Selection model options (optional):
+- `--F50` and `--w` enable a smooth tanh completeness C(F) = 0.5(1 + tanh((F−F50)/w)). If set, they take precedence over `--f-lim`.
+- `--F50-table` and `--w-table` load wavelength-binned tables for F50(λ) and w(λ) from `.npz` or `.csv` files. Tables override scalar values within their wavelength domains.
+
 Example:
-- `jlc classify input.csv --out output.csv`
+- `jlc classify input.csv --out output.csv --F50 1.5e-17 --w 5e-18`
 
 Outputs include per-label columns like `logZ_lae`, `logZ_oii`, `logZ_fake`, `p_lae`, `p_oii`, `p_fake`, plus diagnostics described below.
 
@@ -22,7 +25,8 @@ Generate a mock catalog over a rectangular sky region and classify it with the b
 Common options:
 - `--ra-low/--ra-high` and `--dec-low/--dec-high`: sky bounds (deg)
 - `--wave-min/--wave-max`: wavelength band (Å)
-- `--f-lim`: selection flux threshold guiding completeness and priors
+- `--f-lim`: selection flux threshold guiding completeness and priors (used if smooth tanh not set)
+- `--F50`, `--w`: enable smooth tanh completeness C(F) = 0.5(1 + tanh((F−F50)/w)); if set, they take precedence over `--f-lim`.
 - `--flux-err`: measurement noise (stddev) applied when generating measurements
 - `--out-catalog`: path to save the simulated input catalog
 - `--out-classified`: path to save the classification results

@@ -20,14 +20,19 @@ from jlc.simulate import simulate_catalog_from_model
 
 def build_default_context_and_registry(f_lim: float | None = None, wave_min: float | None = None, wave_max: float | None = None, volume_mode: str | None = None,
                                         n_fibers: int | None = None, ifu_count: int | None = None, exposure_scale: float | None = None,
-                                        search_measure_scale: float | None = None):
+                                        search_measure_scale: float | None = None, F50: float | None = None, w: float | None = None,
+                                        F50_table: dict | tuple | None = None, w_table: dict | tuple | None = None):
     # Context with simple caches
     cosmo = AstropyCosmology()
-    selection = SelectionModel(f_lim=f_lim)
+    selection = SelectionModel(f_lim=f_lim, F50=F50, w=w, F50_table=F50_table, w_table=w_table)
     caches = {
         "flux_grid": FluxGrid(),
     }
     config = {"f_lim": f_lim}
+    if F50 is not None:
+        config["F50"] = float(F50)
+    if w is not None:
+        config["w"] = float(w)
     if wave_min is not None:
         config["wave_min"] = float(wave_min)
     if wave_max is not None:
@@ -68,7 +73,24 @@ def build_default_context_and_registry(f_lim: float | None = None, wave_min: flo
 
 def cmd_classify(args) -> int:
     df = pd.read_csv(args.input)
-    ctx, registry = build_default_context_and_registry()
+    # Optional completeness tables
+    F50_table = None
+    w_table = None
+    if getattr(args, "F50_table", None):
+        try:
+            from jlc.selection.base import SelectionModel as _Sel
+            F50_table = _Sel.load_table(args.F50_table)
+        except Exception as e:
+            print(f"[jlc.classify] Warning: failed to load F50_table from {args.F50_table}: {e}")
+            F50_table = None
+    if getattr(args, "w_table", None):
+        try:
+            from jlc.selection.base import SelectionModel as _Sel
+            w_table = _Sel.load_table(args.w_table)
+        except Exception as e:
+            print(f"[jlc.classify] Warning: failed to load w_table from {args.w_table}: {e}")
+            w_table = None
+    ctx, registry = build_default_context_and_registry(F50=getattr(args, "F50", None), w=getattr(args, "w", None), F50_table=F50_table, w_table=w_table)
     engine = JaynesianEngine(registry, ctx)
     out = engine.compute_log_evidence_matrix(df)
     out = engine.normalize_posteriors(out)
@@ -79,6 +101,24 @@ def cmd_classify(args) -> int:
 def cmd_simulate(args) -> int:
     # Build sky
     sky = SkyBox(args.ra_low, args.ra_high, args.dec_low, args.dec_high)
+
+    # Optional completeness tables
+    F50_table = None
+    w_table = None
+    if getattr(args, "F50_table", None):
+        try:
+            from jlc.selection.base import SelectionModel as _Sel
+            F50_table = _Sel.load_table(args.F50_table)
+        except Exception as e:
+            print(f"[jlc.simulate] Warning: failed to load F50_table from {args.F50_table}: {e}")
+            F50_table = None
+    if getattr(args, "w_table", None):
+        try:
+            from jlc.selection.base import SelectionModel as _Sel
+            w_table = _Sel.load_table(args.w_table)
+        except Exception as e:
+            print(f"[jlc.simulate] Warning: failed to load w_table from {args.w_table}: {e}")
+            w_table = None
 
     # Optionally build empirical fake λ-PDF cache from calibration CSV
     fake_lambda_cache = None
@@ -122,6 +162,10 @@ def cmd_simulate(args) -> int:
             ifu_count=getattr(args, "ifu_count", None),
             exposure_scale=getattr(args, "exposure_scale", None),
             search_measure_scale=getattr(args, "search_measure_scale", None),
+            F50=getattr(args, "F50", None),
+            w=getattr(args, "w", None),
+            F50_table=F50_table,
+            w_table=w_table,
         )
         # Attach empirical fake λ-PDF cache if available
         if fake_lambda_cache is not None:
@@ -173,6 +217,10 @@ def cmd_simulate(args) -> int:
             ifu_count=getattr(args, "ifu_count", None),
             exposure_scale=getattr(args, "exposure_scale", None),
             search_measure_scale=getattr(args, "search_measure_scale", None),
+            F50=getattr(args, "F50", None),
+            w=getattr(args, "w", None),
+            F50_table=F50_table,
+            w_table=w_table,
         )
         if fake_lambda_cache is not None:
             try:
@@ -210,6 +258,11 @@ def main(argv=None):
     p_classify = sub.add_parser("classify", help="Classify a catalog CSV")
     p_classify.add_argument("input", help="Input CSV path")
     p_classify.add_argument("--out", required=True, help="Output CSV path")
+    # SelectionModel smooth completeness knobs (optional)
+    p_classify.add_argument("--F50", dest="F50", type=float, default=None, help="Flux at 50% completeness for smooth tanh selection (overrides f_lim if set)")
+    p_classify.add_argument("--w", dest="w", type=float, default=None, help="Transition width for smooth tanh selection (requires F50)")
+    p_classify.add_argument("--F50-table", dest="F50_table", default=None, help="Path to F50(λ) table (.npz or .csv with bin_left,value)")
+    p_classify.add_argument("--w-table", dest="w_table", default=None, help="Path to w(λ) table (.npz or .csv with bin_left,value)")
     p_classify.set_defaults(func=cmd_classify)
 
     p_sim = sub.add_parser("simulate", help="Generate a mock catalog and classify")
@@ -220,7 +273,12 @@ def main(argv=None):
     p_sim.add_argument("--dec-high", dest="dec_high", type=float, default=5.0)
     p_sim.add_argument("--wave-min", dest="wave_min", type=float, default=4800.0)
     p_sim.add_argument("--wave-max", dest="wave_max", type=float, default=9800.0)
-    p_sim.add_argument("--f-lim", dest="f_lim", type=float, default=1e-17, help="Flux threshold for selection")
+    p_sim.add_argument("--f-lim", dest="f_lim", type=float, default=1e-17, help="Flux threshold for selection (used if smooth tanh not set)")
+    # SelectionModel smooth completeness knobs (optional)
+    p_sim.add_argument("--F50", dest="F50", type=float, default=None, help="Flux at 50% completeness for smooth tanh selection (overrides f_lim if set)")
+    p_sim.add_argument("--w", dest="w", type=float, default=None, help="Transition width for smooth tanh selection (requires F50)")
+    p_sim.add_argument("--F50-table", dest="F50_table", default=None, help="Path to F50(λ) table (.npz or .csv with bin_left,value)")
+    p_sim.add_argument("--w-table", dest="w_table", default=None, help="Path to w(λ) table (.npz or .csv with bin_left,value)")
     p_sim.add_argument("--flux-err", dest="flux_err", type=float, default=5e-18, help="Per-object flux error")
     p_sim.add_argument("--lae-frac", dest="lae_frac", type=float, default=0.3)
     p_sim.add_argument("--oii-frac", dest="oii_frac", type=float, default=0.3)

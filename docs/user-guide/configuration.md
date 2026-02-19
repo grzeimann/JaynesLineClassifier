@@ -13,9 +13,18 @@ JLC pulls run-time configuration from CLI options and stores them in a shared co
 
 ## Selection model
 
-The default `SelectionModel` applies a hard-completeness step at `f_lim`:
+By default, `SelectionModel` applies a hard-completeness step at `f_lim`:
 - completeness(F, λ) = 1 if F > f_lim, else 0.
-This selection shapes both PPP simulation and classification rate priors.
+
+Alternatively, you can enable a smooth tanh completeness curve with `--F50` and `--w`:
+- C(F) = 0.5 · (1 + tanh((F − F50)/w))
+- If `F50` and `w` are provided, they take precedence over `f_lim`.
+
+Wavelength-dependent completeness (optional):
+- Provide wavelength-binned tables for F50(λ) and/or w(λ) via `--F50-table` and `--w-table`.
+- File formats supported: `.npz` (preferred; arrays `bins` and `values`) or `.csv` with two columns: `bin_left,value` per row. The last right edge is reconstructed for CSV using the median bin width.
+- Tables override scalar `F50`/`w` within their wavelength domain; outside the table range, scalar values (or legacy behavior) are used.
+- Programmatic I/O: `SelectionModel.save_table(path, bins, values)` and `SelectionModel.load_table(path)`.
 
 ## Label models
 

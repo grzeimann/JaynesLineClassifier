@@ -115,6 +115,7 @@ If you pass --plot-prefix NAME to the simulate command, two figures are written:
 ## Configuration and context keys
 These keys are set by the CLI and used internally by models:
 - f_lim: flux threshold guiding selection completeness and the Fake flux prior.
+- F50, w: optional smooth tanh selection parameters. If both are provided, completeness uses C(F) = 0.5(1 + tanh((F−F50)/w)) and they take precedence over f_lim.
 - wave_min, wave_max: wavelength band for the run.
 - fake_rate_per_sr_per_A: PPP-mode fake rate density; also used by the Fake label’s rate prior.
 - ppp_expected_counts: dict of expected counts by label computed during PPP simulation (used as global prior weights by the classifier).
