@@ -32,19 +32,6 @@ class JaynesianEngine:
             out[f"logZ_{label}"] = vals
         return out
 
-    def compute_log_evidence_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Deprecated: use compute_extra_log_likelihood_matrix instead.
-
-        This shim emits a DeprecationWarning and forwards to the new API.
-        """
-        import warnings
-        warnings.warn(
-            "JaynesianEngine.compute_log_evidence_matrix is deprecated; use compute_extra_log_likelihood_matrix()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.compute_extra_log_likelihood_matrix(df)
-
     def compute_posteriors(self, df: pd.DataFrame, log_prior_weights: dict | None = None, mode: str | None = None) -> pd.DataFrame:
         """Compute per-label evidences and return a DataFrame with posteriors and diagnostics.
 
@@ -81,24 +68,8 @@ class JaynesianEngine:
         if engine_mode not in {"rate_only", "likelihood_only", "rate_times_likelihood"}:
             engine_mode = "rate_times_likelihood"
 
-        # Optional global prior weights (e.g., PPP expected counts)
-        if not use_global_priors:
-            log_prior_weights = None
-        logW = (
-            np.array([log_prior_weights.get(L, 0.0) for L in labels], dtype=float)
-            if log_prior_weights
-            else np.zeros(len(labels))
-        )
-
         # Compute per-row, per-label rate densities and add as diagnostics
         rates = np.zeros((len(out), len(labels)), dtype=float)
-        # Optional: per-component fake rate diagnostics
-        fake_component_names = None
-        fake_components_matrix = None
-        has_fake = "fake" in labels
-        j_fake = labels.index("fake") if has_fake else -1
-        fake_model = self.registry.model("fake") if has_fake else None
-        expose_fake_components = has_fake and hasattr(fake_model, "rate_components")
 
         # First pass: compute label rates and (optionally) record fake components
         for i, (_, row) in enumerate(out.iterrows()):
@@ -109,19 +80,7 @@ class JaynesianEngine:
                 except Exception:
                     r = 1.0
                 rates[i, j] = max(r, 0.0)
-            # per-row fake components
-            if expose_fake_components:
-                try:
-                    comps = fake_model.rate_components(row, self.ctx)  # dict[name->rate]
-                    if fake_component_names is None:
-                        fake_component_names = list(comps.keys())
-                        fake_components_matrix = np.zeros((len(out), len(fake_component_names)), dtype=float)
-                    # align by known names; ignore unexpected
-                    for cj, name in enumerate(fake_component_names):
-                        val = float(comps.get(name, 0.0))
-                        fake_components_matrix[i, cj] = max(val, 0.0)
-                except Exception:
-                    pass
+
 
         # Evidence matrix (log)
         logZ = np.vstack([out.get(f"logZ_{L}", np.full(len(out), -np.inf)) for L in labels]).T  # (N, K)
@@ -143,21 +102,9 @@ class JaynesianEngine:
         # Emit per-label rate diagnostics
         for j, L in enumerate(labels):
             out[f"rate_{L}"] = rates[:, j]
-        # Emit per-component fake rate diagnostics if available
-        if expose_fake_components and fake_component_names is not None and fake_components_matrix is not None:
-            for cj, name in enumerate(fake_component_names):
-                col = f"rate_fake_{name}"
-                out[col] = fake_components_matrix[:, cj]
 
         # Combine log rate prior with data evidence
-        # Optionally emit the global log prior weights used (one per label, same for all rows)
-        if log_prior_weights is not None and use_global_priors:
-            try:
-                for j, L in enumerate(labels):
-                    out[f"log_prior_weight_{L}"] = float(logW[j])
-            except Exception:
-                pass
-        logP_unnorm = logZ + logR + logW[None, :]
+        logP_unnorm = logZ + logR
 
         # log-softmax
         m = np.max(logP_unnorm, axis=1, keepdims=True)
@@ -185,7 +132,6 @@ class JaynesianEngine:
 
         # Record which priors/mode were applied
         out["use_rate_priors"] = bool(use_rate_priors)
-        out["use_global_priors"] = bool(use_global_priors)
         out["engine_mode"] = engine_mode
 
         # If a calibrated/used fake rate is present in context, record it for traceability
