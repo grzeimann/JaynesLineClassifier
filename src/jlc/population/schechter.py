@@ -1,4 +1,5 @@
 import numpy as np
+from jlc.utils.constants import EPS_LOG
 
 
 class SchechterLF:
@@ -24,7 +25,7 @@ class SchechterLF:
         phistar = 10 ** self.log10_phistar
         # Base Schechter form
         x = np.where(Lstar > 0, L / Lstar, 0.0)
-        phi = (phistar / max(Lstar, 1e-300)) * (np.power(x, self.alpha, where=x>0) * np.exp(-x))
+        phi = (phistar / max(Lstar, EPS_LOG)) * (np.power(x, self.alpha, where=x>0) * np.exp(-x))
         # Apply luminosity bounds if provided
         if self.Lmin is not None or self.Lmax is not None:
             mask = np.ones_like(L, dtype=bool)

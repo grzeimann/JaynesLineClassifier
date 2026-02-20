@@ -8,3 +8,20 @@ class LabelRegistry:
 
     def model(self, label: str):
         return self._labels[label]
+
+    # Convenience properties for common LFs
+    @property
+    def lae_lf(self):
+        try:
+            m = self._labels.get("lae")
+            return getattr(m, "lf", None)
+        except Exception:
+            return None
+
+    @property
+    def oii_lf(self):
+        try:
+            m = self._labels.get("oii")
+            return getattr(m, "lf", None)
+        except Exception:
+            return None

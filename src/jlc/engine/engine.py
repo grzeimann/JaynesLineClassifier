@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from jlc.utils.constants import EPS_LOG
 
 
 class JaynesianEngine:
@@ -7,17 +8,68 @@ class JaynesianEngine:
         self.registry = registry
         self.ctx = ctx
 
-    def compute_log_evidence_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
+    def compute_extra_log_likelihood_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute per-label measurement-only evidence (flux-marginalized).
+
+        Preferred API: evaluate each label's extra_log_likelihood(row, ctx).
+        Output columns retain the historical naming convention logZ_<label> to
+        avoid breaking downstream consumers; documentation clarifies that these
+        derive from extra_log_likelihood under the refactored architecture.
+        """
         out = df.copy()
         for label in self.registry.labels:
             model = self.registry.model(label)
-            out[f"logZ_{label}"] = [
-                model.log_evidence(row, self.ctx).log_evidence
-                for _, row in df.iterrows()
-            ]
+            vals = []
+            for _, row in df.iterrows():
+                try:
+                    v = model.extra_log_likelihood(row, self.ctx)
+                    val = float(v)
+                    if not np.isfinite(val):
+                        val = -np.inf
+                except Exception:
+                    val = -np.inf
+                vals.append(val)
+            out[f"logZ_{label}"] = vals
         return out
 
-    def normalize_posteriors(self, df: pd.DataFrame, log_prior_weights: dict | None = None) -> pd.DataFrame:
+    def compute_log_evidence_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Deprecated: use compute_extra_log_likelihood_matrix instead.
+
+        This shim emits a DeprecationWarning and forwards to the new API.
+        """
+        import warnings
+        warnings.warn(
+            "JaynesianEngine.compute_log_evidence_matrix is deprecated; use compute_extra_log_likelihood_matrix()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.compute_extra_log_likelihood_matrix(df)
+
+    def compute_posteriors(self, df: pd.DataFrame, log_prior_weights: dict | None = None, mode: str | None = None) -> pd.DataFrame:
+        """Compute per-label evidences and return a DataFrame with posteriors and diagnostics.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Input catalog with at least wave_obs, flux_hat, flux_err; additional columns may be used by labels.
+        log_prior_weights : dict | None
+            Optional global per-label log-weights (e.g., from PPP expected counts). Keys must match registry.labels.
+        mode : {"rate_only", "likelihood_only", "rate_times_likelihood"} or None
+            Posterior combination mode (case-insensitive). If None, uses ctx.config.get("engine_mode", "rate_times_likelihood").
+
+        Returns
+        -------
+        pandas.DataFrame
+            Copy of df with added columns:
+            - logZ_<label>: measurement-only evidence from extra_log_likelihood
+            - rate_<label>: observed-space rate density for each label
+            - p_<label>: posterior probability per label
+            - Additional diagnostics (e.g., totals, prior flags), depending on configuration.
+        """
+        evid = self.compute_extra_log_likelihood_matrix(df)
+        return self.normalize_posteriors(evid, log_prior_weights=log_prior_weights, mode=mode)
+
+    def normalize_posteriors(self, df: pd.DataFrame, log_prior_weights: dict | None = None, mode: str | None = None) -> pd.DataFrame:
         out = df.copy()
         labels = self.registry.labels
 
@@ -25,6 +77,9 @@ class JaynesianEngine:
         cfg = getattr(self.ctx, "config", {}) or {}
         use_rate_priors = bool(cfg.get("use_rate_priors", True))
         use_global_priors = bool(cfg.get("use_global_priors", True))
+        engine_mode = (mode or cfg.get("engine_mode") or "rate_times_likelihood").strip().lower()
+        if engine_mode not in {"rate_only", "likelihood_only", "rate_times_likelihood"}:
+            engine_mode = "rate_times_likelihood"
 
         # Optional global prior weights (e.g., PPP expected counts)
         if not use_global_priors:
@@ -68,11 +123,22 @@ class JaynesianEngine:
                 except Exception:
                     pass
 
-        # If evidence-only mode is requested, override rates with 1.0 (neutral prior)
+        # Evidence matrix (log)
+        logZ = np.vstack([out.get(f"logZ_{L}", np.full(len(out), -np.inf)) for L in labels]).T  # (N, K)
+
+        # Apply mode and rate prior toggles
+        with np.errstate(divide='ignore'):
+            logR = np.log(rates + EPS_LOG)
         if not use_rate_priors:
-            rates[:, :] = 1.0
-            # In evidence-only mode, per-component fake rate diagnostics are not meaningful; skip emitting them
+            # evidence-only requested via config: neutralize rate priors
+            logR[:, :] = 0.0
             expose_fake_components = False
+        # Engine mode overrides combination
+        if engine_mode == "rate_only":
+            logZ[:, :] = 0.0
+        elif engine_mode == "likelihood_only":
+            logR[:, :] = 0.0
+        # else combined: keep both
 
         # Emit per-label rate diagnostics
         for j, L in enumerate(labels):
@@ -91,9 +157,6 @@ class JaynesianEngine:
                     out[f"log_prior_weight_{L}"] = float(logW[j])
             except Exception:
                 pass
-        logZ = np.vstack([out[f"logZ_{L}"].values for L in labels]).T  # (N, K)
-        with np.errstate(divide='ignore'):
-            logR = np.log(rates + 1e-300)
         logP_unnorm = logZ + logR + logW[None, :]
 
         # log-softmax
@@ -113,16 +176,17 @@ class JaynesianEngine:
             rate_fake = rates[:, j_fake]
             rate_phys = np.sum(rates, axis=1) - rate_fake
             # Avoid division by zero
-            prior_odds = np.where(rate_fake > 0, rate_phys / np.maximum(rate_fake, 1e-300), np.nan)
+            prior_odds = np.where(rate_fake > 0, rate_phys / np.maximum(rate_fake, EPS_LOG), np.nan)
             out["rate_fake_total"] = rate_fake
             out["rate_phys_total"] = rate_phys
             out["prior_odds_phys_over_fake"] = prior_odds
         else:
             out["rate_phys_total"] = np.sum(rates, axis=1)
 
-        # Record which priors were applied
+        # Record which priors/mode were applied
         out["use_rate_priors"] = bool(use_rate_priors)
         out["use_global_priors"] = bool(use_global_priors)
+        out["engine_mode"] = engine_mode
 
         # If a calibrated/used fake rate is present in context, record it for traceability
         try:

@@ -100,7 +100,7 @@ Key options for PPP mode:
 - --nz: number of redshift grid points used to construct the intensity (default 256).
 
 Columns in the simulated catalog (both modes):
-- ra, dec, true_class, wave_obs, flux_hat, flux_err
+- ra, dec, true_class, wave_obs, flux_hat, flux_err, snr (if --snr-min provided, only rows with snr >= threshold are kept)
 
 Notes:
 - The selection model used during classification is configured with the same --f-lim value. In PPP mode, the selection also shapes the generated population via S(F, λ_obs).

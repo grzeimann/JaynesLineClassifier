@@ -3,6 +3,12 @@ from typing import Optional, Tuple, Dict, Any
 
 
 class SelectionModel:
+    """Standalone selection completeness model C(F, λ[, RA, Dec]) ∈ [0,1].
+
+    - Hard threshold via f_lim or smooth tanh via F50, w.
+    - Optional wavelength-binned tables F50(λ), w(λ) overriding scalars within table domain.
+    - Optional RA/Dec modulation factor g(ra, dec, λ) ∈ [0,1] applied multiplicatively.
+    """
     def __init__(
         self,
         f_lim: float | None = None,
@@ -10,6 +16,7 @@ class SelectionModel:
         w: float | None = None,
         F50_table: Optional[Tuple[np.ndarray, np.ndarray]] | Optional[Dict[str, Any]] = None,
         w_table: Optional[Tuple[np.ndarray, np.ndarray]] | Optional[Dict[str, Any]] = None,
+        ra_dec_factor: Any | None = None,
     ):
         """Selection model with smooth or hard completeness.
 
@@ -39,6 +46,49 @@ class SelectionModel:
         self.w = float(w) if w is not None else None
         self._F50_table = self._sanitize_table(F50_table)
         self._w_table = self._sanitize_table(w_table)
+        # Optional RA/Dec-dependent multiplicative factor g(ra,dec,λ) ∈ [0,1]
+        # Accepts a callable or None. If provided as a dict in future, callers
+        # should wrap their loader as a callable to avoid tight coupling here.
+        self._ra_dec_factor = ra_dec_factor if callable(ra_dec_factor) else None
+
+    # Convenience vector API per refactor plan
+    def completeness_vector(self, df, out_col: str = "completeness"):
+        """Compute completeness for each row of a DataFrame.
+
+        Uses flux_hat if available, otherwise flux_true. Requires wave_obs.
+        Optionally uses RA/Dec columns if available via ra_dec_factor.
+        Returns a new Series and does not modify the input unless out_col is provided
+        and the caller assigns it.
+        """
+        try:
+            import pandas as _pd  # local import to avoid hard dep at import time
+            if not isinstance(df, _pd.DataFrame):
+                return None
+            lam = _pd.to_numeric(df.get("wave_obs"), errors="coerce").to_numpy(dtype=float)
+            ra = _pd.to_numeric(df.get("ra"), errors="coerce").to_numpy(dtype=float) if "ra" in df.columns else None
+            dec = _pd.to_numeric(df.get("dec"), errors="coerce").to_numpy(dtype=float) if "dec" in df.columns else None
+            # prefer measured flux
+            Fh = _pd.to_numeric(df.get("flux_hat"), errors="coerce").to_numpy(dtype=float) if "flux_hat" in df.columns else None
+            if Fh is None or not np.any(np.isfinite(Fh)):
+                Fh = _pd.to_numeric(df.get("flux_true"), errors="coerce").to_numpy(dtype=float) if "flux_true" in df.columns else None
+            if Fh is None:
+                # if no flux available, return NaNs
+                return _pd.Series(np.full(len(df), np.nan), index=df.index, name=out_col)
+            # Evaluate row-wise to respect current completeness(F, scalar λ) API
+            out = np.empty(len(df), dtype=float)
+            for i in range(len(df)):
+                Fi = Fh[i]
+                li = lam[i] if i < lam.size else np.nan
+                rai = ra[i] if ra is not None and i < ra.size else None
+                deci = dec[i] if dec is not None and i < dec.size else None
+                if not np.isfinite(Fi) or not np.isfinite(li):
+                    out[i] = np.nan
+                    continue
+                ci = self.completeness(np.asarray([Fi], dtype=float), float(li), ra=rai, dec=deci)
+                out[i] = float(ci[0]) if np.size(ci) > 0 else np.nan
+            return _pd.Series(out, index=df.index, name=out_col)
+        except Exception:
+            return None
 
     # --- Table I/O helpers ---
     @staticmethod
@@ -146,13 +196,25 @@ class SelectionModel:
         except Exception:
             return None
 
-    def completeness(self, F: np.ndarray, wave_obs: float) -> np.ndarray:
+    def completeness_single(self, F: float, wave_obs: float, ra: float | None = None, dec: float | None = None, context: Any | None = None) -> float:
+        """Scalar convenience wrapper: C(F, λ[, RA, Dec]).
+        RA/Dec/context are accepted; RA/Dec optionally modulate completeness via ra_dec_factor.
+        """
+        try:
+            c = self.completeness(np.asarray([float(F)], dtype=float), float(wave_obs), ra=ra, dec=dec)
+            v = float(c[0]) if np.size(c) > 0 else 0.0
+            return float(np.clip(v, 0.0, 1.0))
+        except Exception:
+            return 0.0
+
+    def completeness(self, F: np.ndarray, wave_obs: float, ra: float | None = None, dec: float | None = None) -> np.ndarray:
         """Return selection completeness in [0,1] for each flux value at given wave.
 
         Notes
         -----
         - Vectorized over F.
         - Supports optional wavelength dependence via binned F50(λ) and w(λ) tables.
+        - Optionally modulated by an RA/Dec-dependent factor g(ra,dec,λ)∈[0,1] when provided.
         - Guarantees outputs in [0,1].
         """
         F = np.asarray(F, dtype=float)
@@ -167,10 +229,21 @@ class SelectionModel:
         if F50_eff is not None and w_eff is not None and np.isfinite(F50_eff) and np.isfinite(w_eff) and w_eff > 0:
             x = (F - F50_eff) / w_eff
             C = 0.5 * (1.0 + np.tanh(x))
-            # numerical safety: clamp to [0,1]
-            return np.clip(C, 0.0, 1.0)
-        # Hard threshold fallback
-        if self.f_lim is not None and np.isfinite(self.f_lim):
-            return (F > self.f_lim).astype(float)
-        # Legacy: always selected
-        return np.ones_like(F)
+        elif self.f_lim is not None and np.isfinite(self.f_lim):
+            # Hard threshold fallback
+            C = (F > self.f_lim).astype(float)
+        else:
+            # Legacy: always selected
+            C = np.ones_like(F)
+        # Optional RA/Dec modulation (multiplicative), applied uniformly across F values for this row
+        if self._ra_dec_factor is not None and (ra is not None or dec is not None):
+            try:
+                g = float(self._ra_dec_factor(ra, dec, float(wave_obs)))
+                if not np.isfinite(g):
+                    g = 1.0
+                g = float(np.clip(g, 0.0, 1.0))
+                C = C * g
+            except Exception:
+                # ignore RA/Dec factor errors to preserve robustness
+                pass
+        return np.clip(C, 0.0, 1.0)

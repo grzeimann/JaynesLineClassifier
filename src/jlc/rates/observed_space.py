@@ -103,6 +103,35 @@ def effective_search_measure(row: Any, ctx: Any) -> float:
         return 1.0
 
 
+def validate_fake_rate_against_catalog(df: Any, rho: float, ra_low: float, ra_high: float, dec_low: float, dec_high: float,
+                                       wave_min: float, wave_max: float) -> Dict[str, float]:
+    """
+    Validate a homogeneous fake rate ρ against a catalog assumed to be from a virtual run.
+
+    Computes expected count N̂ = ρ · Ω · Δλ and compares to the observed count N.
+    Returns a dict with fields: {rho, N_obs, N_exp, rel_err, passed}.
+    """
+    import numpy as _np
+    from jlc.simulate.model_ppp import skybox_solid_angle_sr as _omega
+    try:
+        lam = _np.asarray(df.get("wave_obs")).astype(float)
+        N_obs = int(_np.sum(_np.isfinite(lam) & (lam >= float(wave_min)) & (lam <= float(wave_max))))
+    except Exception:
+        N_obs = 0
+    try:
+        Omega = float(_omega(ra_low, ra_high, dec_low, dec_high))
+        Dlam = float(wave_max - wave_min)
+        N_exp = float(max(rho, 0.0)) * max(Omega, 0.0) * max(Dlam, 0.0)
+    except Exception:
+        N_exp = 0.0
+    # Relative error with safe denominator
+    denom = max(abs(N_obs), 1.0)
+    rel_err = abs(N_obs - N_exp) / denom
+    # A simple pass/fail heuristic: within 10% or absolute diff <= 1
+    passed = bool((rel_err <= 0.1) or (abs(N_obs - N_exp) <= 1.0))
+    return {"rho": float(rho), "N_obs": float(N_obs), "N_exp": float(N_exp), "rel_err": float(rel_err), "passed": passed}
+
+
 def build_fake_lambda_pdf(wave_obs: np.ndarray, wave_min: float, wave_max: float, nbins: int = 200) -> Dict[str, np.ndarray | float]:
     """
     Build an empirical PDF over wavelength from virtual detections.

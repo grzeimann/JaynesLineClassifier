@@ -13,6 +13,7 @@ nav:
       - Quickstart: getting-started/quickstart.md
   - User Guide:
       - CLI Usage: user-guide/cli.md
+      - Refactor Architecture: user-guide/refactor_architecture.md
       - Configuration: user-guide/configuration.md
       - Examples: user-guide/examples.md
   - Algorithms: algorithms/overview.md

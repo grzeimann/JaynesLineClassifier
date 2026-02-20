@@ -2,9 +2,20 @@ import numpy as np
 import pandas as pd
 from .base import LabelModel
 from jlc.types import EvidenceResult
+from jlc.utils.constants import EPS_LOG
 
 
 class FakeLabel(LabelModel):
+    """Fake label model: contextual rate prior + flux-marginalized evidence.
+
+    - rate_density(row, ctx): base fake rate per sr per Å, optionally a simple
+      mixture over components (e.g., sky_residual, noise) and modulated by an
+      empirical λ-PDF if available; multiplied by effective_search_measure.
+    - extra_log_likelihood(row, ctx): measurement-only evidence marginalized
+      over latent flux using the shared FluxGrid with a neutral prior on F.
+    - simulate_catalog(...): per-label simulator consistent with the same
+      ingredients used in rate_density; yields diagnostics like μ and band size.
+    """
     label = "fake"
 
     def __init__(self, selection_model=None, measurement_modules=None, mu_ln_offset: float = -2.0, sigma_ln: float = 1.0,
@@ -117,14 +128,12 @@ class FakeLabel(LabelModel):
         sigma = self.sigma_ln
         # log pdf of lognormal
         F = np.asarray(F, dtype=float)
-        F_safe = np.clip(F, 1e-300, None)
+        F_safe = np.clip(F, EPS_LOG, None)
         return -0.5 * ((np.log(F_safe) - mu) / sigma) ** 2 - np.log(F_safe * sigma * np.sqrt(2 * np.pi))
 
-    def log_evidence(self, row: pd.Series, ctx) -> EvidenceResult:
-        # Evidence should be the measurement likelihood marginalized over F with neutral prior.
-        # All fake population assumptions (wavelength band, flux prior, selection) live in rate priors.
+    def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
+        """Measurement-only evidence marginalized over F with neutral prior (no z)."""
         F_grid, log_w = ctx.caches["flux_grid"].grid(row)
-
         log_like = np.zeros_like(F_grid)
         for k, F in enumerate(F_grid):
             latent = {"F_true": float(F)}
@@ -132,6 +141,89 @@ class FakeLabel(LabelModel):
             for m in self.measurement_modules:
                 ll += float(m.log_likelihood(row, latent, ctx))
             log_like[k] = ll
-
         logZ = ctx.caches["flux_grid"].logsumexp(log_like + log_w)
-        return EvidenceResult(self.label, float(logZ), {})
+        return float(logZ)
+
+    def log_evidence(self, row: pd.Series, ctx) -> EvidenceResult:
+        # Deprecated shim: emit warning and wrap extra_log_likelihood in EvidenceResult
+        import warnings as _warnings
+        _warnings.warn(
+            "FakeLabel.log_evidence is deprecated; use extra_log_likelihood() and engine posterior combination",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        ell = self.extra_log_likelihood(row, ctx)
+        return EvidenceResult(self.label, float(ell), {})
+
+    # --- New per-label simulator (engine-aligned) ---
+    def simulate_catalog(
+        self,
+        ctx,
+        ra_low: float,
+        ra_high: float,
+        dec_low: float,
+        dec_high: float,
+        wave_min: float,
+        wave_max: float,
+        flux_err: float = 1e-17,
+        f_lim: float | None = None,
+        fake_rate_per_sr_per_A: float = 0.0,
+        rng=None,
+        nz: int = 256,
+        snr_min: float | None = None,
+    ):
+        import numpy as _np
+        import pandas as _pd
+        from jlc.simulate.model_ppp import skybox_solid_angle_sr, _cap_events
+        rng = rng or _np.random.default_rng()
+        # Base rate and expected count over sky x wavelength band
+        rho = self._base_rho(ctx)
+        omega = skybox_solid_angle_sr(ra_low, ra_high, dec_low, dec_high)
+        band = max(0.0, float(wave_max - wave_min))
+        mu = float(rho * omega * band)
+        n = _cap_events(self.label, int(max(0, _np.random.poisson(mu) if _np.isfinite(mu) and mu > 0 else 0)), mu)
+        if n <= 0:
+            return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
+                "label": self.label, "mu": float(mu), "band_A": float(band), "rho": float(rho)
+            }
+        # Sample sky uniformly per steradian
+        ra = rng.uniform(ra_low, ra_high, size=n)
+        s1 = _np.sin(_np.deg2rad(dec_low)); s2 = _np.sin(_np.deg2rad(dec_high))
+        u = rng.uniform(min(s1, s2), max(s1, s2), size=n)
+        dec = _np.rad2deg(_np.arcsin(u))
+        # Sample wavelength uniformly over band
+        lam = rng.uniform(wave_min, wave_max, size=n)
+        # Flux prior: log-normal around f_lim baseline
+        base = max(float(f_lim) if f_lim is not None else 1e-17, 1e-20)
+        mu_ln = _np.log(base) + self.mu_ln_offset
+        sigma_ln = self.sigma_ln
+        F_true = rng.lognormal(mean=mu_ln, sigma=sigma_ln, size=n)
+        F_err = _np.full(n, float(flux_err))
+        F_hat = _np.clip(F_true + rng.normal(0.0, F_err), 0.0, None)
+        # Apply selection acceptance per event
+        C = _np.empty(n, dtype=float)
+        sel = self.selection
+        for i in range(n):
+            try:
+                ci = sel.completeness(_np.asarray([F_true[i]], dtype=float), float(lam[i]))
+                C[i] = float(ci[0]) if _np.size(ci) > 0 else 0.0
+            except Exception:
+                C[i] = 1.0
+        C = _np.clip(C, 0.0, 1.0)
+        keep = rng.uniform(0.0, 1.0, size=n) < C
+        if not _np.any(keep):
+            return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
+                "label": self.label, "mu": float(mu), "band_A": float(band), "rho": float(rho)
+            }
+        ra = ra[keep]; dec = dec[keep]; lam = lam[keep]
+        F_true = F_true[keep]; F_err = F_err[keep]; F_hat = F_hat[keep]
+        df = _pd.DataFrame({
+            "ra": ra,
+            "dec": dec,
+            "true_class": _np.array([self.label]*ra.size),
+            "wave_obs": lam,
+            "flux_true": F_true,
+            "flux_hat": F_hat,
+            "flux_err": F_err,
+        })
+        return df, {"label": self.label, "mu": float(mu), "band_A": float(band), "rho": float(rho)}

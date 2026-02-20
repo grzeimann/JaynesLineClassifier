@@ -15,6 +15,7 @@ Both simple and PPP simulators write:
 - `wave_obs`: observed wavelength (Å)
 - `flux_hat`: measured flux after adding noise
 - `flux_err`: per-object flux error used when generating noise
+- `snr`: signal-to-noise ratio `flux_hat/flux_err` (S/N filter applied if `--snr-min` is provided)
 
 ## Classification outputs (additional columns)
 - `logZ_<label>`: measurement-only log-evidence for each label

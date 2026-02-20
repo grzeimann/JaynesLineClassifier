@@ -2,6 +2,8 @@
 
 JLC pulls run-time configuration from CLI options and stores them in a shared context passed to models. Important keys:
 
+> Rename status: The codebase now prefers `extra_log_likelihood` terminology throughout. Engine/CLI/tests use it end‑to‑end; label classes retain a deprecated `log_evidence` shim (DeprecationWarning, stacklevel=2) delegating to `extra_log_likelihood` for one minor version. Custom labels should implement `extra_log_likelihood(row, ctx)` and may keep a thin `log_evidence` shim during the transition window.
+
 - `f_lim`: flux threshold guiding selection completeness and Fake priors.
 - `wave_min`, `wave_max`: wavelength band for the run (Å).
 - `fake_rate_per_sr_per_A`: fake rate density used in PPP mode and by FakeLabel rate priors.
@@ -35,10 +37,12 @@ Wavelength-dependent completeness (optional):
 
 - Physical labels (LAE, OII):
   - `rate_density(row, ctx)`: integrates LF × dV/dz × selection × Jacobians over flux at the candidate’s wavelength.
-  - `log_evidence(row, ctx)`: measurement-only evidence marginalized over latent flux with a neutral prior.
+  - `extra_log_likelihood(row, ctx)`: measurement-only evidence marginalized over latent flux with a neutral prior.
+    - Note: `log_evidence(row, ctx)` is deprecated and remains as a shim that delegates to `extra_log_likelihood` while emitting a DeprecationWarning.
 - Fake label:
   - `rate_density(row, ctx)`: base fake rate per sr per Å modulated by empirical λ-PDF (if available) and multiplied by effective_search_measure; optionally a simple mixture across components.
-  - `log_evidence(row, ctx)`: measurement-only evidence marginalized over latent flux with a neutral prior.
+  - `extra_log_likelihood(row, ctx)`: measurement-only evidence marginalized over latent flux with a neutral prior.
+    - Note: `log_evidence(row, ctx)` is deprecated and remains as a shim that delegates to `extra_log_likelihood` while emitting a DeprecationWarning.
 
 ## Caches
 

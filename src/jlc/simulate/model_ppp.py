@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from jlc.engine.flux_grid import FluxGrid
+from jlc.utils.logging import log
 
 # Hard safety cap to prevent infeasible allocations when sampling extremely large
 # Poisson counts. If expected counts exceed this, we cap and warn. This avoids
@@ -48,8 +49,8 @@ def _cap_events(label: str, n: int, mu: float) -> int:
     n_int = int(max(0, n))
     if n_int > MAX_EVENTS_PER_LABEL:
         try:
-            print(f"[jlc.simulate] Capping {label} events: drew n={n_int} from mu≈{mu:.3e}, "
-                  f"limiting to {MAX_EVENTS_PER_LABEL} to avoid overflow/memory issues.")
+            log(f"[jlc.simulate] Capping {label} events: drew n={n_int} from mu≈{mu:.3e}, "
+                f"limiting to {MAX_EVENTS_PER_LABEL} to avoid overflow/memory issues.")
         except Exception:
             # Be robust if stdout is not available
             pass
@@ -142,6 +143,65 @@ def _sample_from_weights(rng: np.random.Generator, weights: np.ndarray) -> int:
     return int(rng.choice(len(w), p=p))
 
 
+# ==========================
+# Modular helper functions
+# ==========================
+
+def integrate_rate_over_flux(rate: np.ndarray, F_grid: np.ndarray) -> np.ndarray:
+    """Integrate rate(z, F) over F to produce r(z) on the same z-grid.
+
+    Uses trapezoidal rule along the F axis.
+    """
+    return np.trapz(rate, x=F_grid, axis=1)
+
+
+essentially_zero = lambda x: (not np.isfinite(x)) or (x <= 0.0)
+
+
+def expected_count_from_rate(r_z: np.ndarray, z_grid: np.ndarray, omega_sr: float) -> float:
+    """μ = Ω * ∫ r(z) dz"""
+    if r_z.size == 0:
+        return 0.0
+    mu = float(omega_sr * np.trapz(r_z, x=z_grid))
+    if not np.isfinite(mu):
+        mu = 0.0
+    return mu
+
+
+def expected_volume_from_dVdz(dVdz: np.ndarray, z_grid: np.ndarray, omega_sr: float) -> float:
+    """Comoving volume probed for a label: V = Ω * ∫ dV/dz dz"""
+    V = float(omega_sr * np.trapz(dVdz, x=z_grid))
+    if not np.isfinite(V):
+        V = 0.0
+    return V
+
+
+def sample_z_indices(rng: np.random.Generator, z_grid: np.ndarray, r_z: np.ndarray, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample z-bin indices proportionally to r(z) Δz. Returns (idx, p_z)."""
+    if n <= 0:
+        return np.array([], dtype=int), np.array([], dtype=float)
+    dz = np.gradient(z_grid)
+    w_z = r_z * dz
+    s = np.sum(w_z)
+    if (not np.isfinite(s)) or (s <= 0):
+        return np.array([], dtype=int), w_z
+    p_z = w_z / s
+    idx_z = rng.choice(z_grid.size, size=n, p=p_z)
+    return idx_z.astype(int), p_z
+
+
+def sample_F_given_z(rng: np.random.Generator, rate_row: np.ndarray, F_grid: np.ndarray) -> float:
+    """Sample F conditional on a fixed z, using rate(z, F) as weights (with ΔF)."""
+    dF = np.gradient(F_grid)
+    wF = rate_row * dF
+    s = np.sum(wF)
+    if (not np.isfinite(s)) or (s <= 0):
+        return float(F_grid[int(rng.integers(0, F_grid.size))])
+    pF = wF / s
+    idxF = int(rng.choice(F_grid.size, p=pF))
+    return float(F_grid[idxF])
+
+
 def simulate_catalog_from_model(
     ctx,
     registry,
@@ -156,8 +216,12 @@ def simulate_catalog_from_model(
     fake_rate_per_sr_per_A: float = 0.0,
     seed: Optional[int] = None,
     nz: int = 256,
+    snr_min: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Simulate a catalog via a Poisson point process using model expectations.
+    """[DEPRECATED] Simulate a catalog via a Poisson point process using model expectations.
+
+    This legacy simulator will be removed after the engine-aligned per-label simulation path is stable.
+    Prefer using jlc.simulate.field.simulate_field(), which is the source of truth going forward.
 
     - Counts for LAE/OII are set by integrating the LF over flux and the comoving volume over the
       redshift interval implied by the wavelength band, multiplied by the sky solid angle.
@@ -166,6 +230,10 @@ def simulate_catalog_from_model(
     - Measurements: flux_hat = F_true + N(0, flux_err), clipped to >=0.
     - No hard selection is applied post measurement; selection is encoded via S(F, lambda_obs) in the rate.
     """
+    try:
+        log("[jlc.simulate] WARNING: simulate_catalog_from_model() is LEGACY and will be removed; use simulate_field() instead.")
+    except Exception:
+        pass
     rng = np.random.default_rng(seed)
 
     # Solid angle
@@ -177,7 +245,8 @@ def simulate_catalog_from_model(
     decs = []
     classes = []
     lam_obs_list = []
-    F_true_list = []
+    F_true_list = []  # store true flux (before noise)
+    F_hat_list = []   # store measured flux (after noise)
     F_err_list = []
 
     # Build config and flux grid
@@ -188,6 +257,12 @@ def simulate_catalog_from_model(
     label_volumes = {}
 
     # Loop over labels in registry
+    ppp_debug = False
+    try:
+        ppp_debug = bool(getattr(ctx, "config", {}).get("ppp_debug", False))
+    except Exception:
+        ppp_debug = False
+    debug_info = []
     for label_name in registry.labels:
         model = registry.model(label_name)
         # In virtual volume mode, suppress physical labels entirely
@@ -195,6 +270,8 @@ def simulate_catalog_from_model(
             if str(getattr(ctx, "config", {}).get("volume_mode", "real")).lower() == "virtual" and label_name != "fake":
                 # still record zeros for expectations
                 exp_counts[label_name] = 0.0
+                if ppp_debug:
+                    debug_info.append({"label": label_name, "note": "virtual_mode_suppressed"})
                 continue
         except Exception:
             pass
@@ -204,11 +281,20 @@ def simulate_catalog_from_model(
             mu = rho * omega * max(0.0, float(wave_max - wave_min))
             exp_counts["fake"] = float(mu)
             exp_counts["total"] += float(mu)
+            if ppp_debug:
+                try:
+                    log(f"[jlc.ppp.debug] label=fake Ω={omega:.3e} sr, Δλ={wave_max - wave_min:.1f} Å, ρ={rho:.3e} → μ≈{mu:.3e}")
+                except Exception:
+                    pass
+                debug_info.append({"label": "fake", "omega_sr": omega, "band_A": float(wave_max - wave_min), "rho": rho, "mu": mu})
             n_fake = _poisson_safe(rng, mu)
             n_fake = _cap_events("fake", n_fake, mu)
             if n_fake > 0:
+                # RA uniform; DEC sampled to be uniform per steradian via sin(dec) transform
                 ra = rng.uniform(ra_low, ra_high, size=n_fake)
-                dec = rng.uniform(dec_low, dec_high, size=n_fake)
+                s1 = np.sin(np.deg2rad(dec_low)); s2 = np.sin(np.deg2rad(dec_high))
+                u = rng.uniform(min(s1, s2), max(s1, s2), size=n_fake)
+                dec = np.rad2deg(np.arcsin(u))
                 lam = rng.uniform(wave_min, wave_max, size=n_fake)
                 # Flux prior for fakes: log-normal around f_lim (mostly below)
                 if f_lim is None:
@@ -221,12 +307,35 @@ def simulate_catalog_from_model(
                 F_err = np.full(n_fake, float(flux_err))
                 F_hat = np.clip(F_true + rng.normal(0.0, F_err), 0.0, None)
 
-                ras.append(ra)
-                decs.append(dec)
-                classes.append(np.array(["fake"] * n_fake))
-                lam_obs_list.append(lam)
-                F_true_list.append(F_hat)  # store measured flux as flux_hat later; keep true separately if needed
-                F_err_list.append(F_err)
+                # Apply selection completeness to fakes as a detection probability at (F_true, lambda)
+                # completeness(F, λ) supports vector F and scalar λ; loop over λ to build per-event C
+                try:
+                    sel = ctx.selection
+                    C = np.empty(n_fake, dtype=float)
+                    for i in range(n_fake):
+                        Ci = sel.completeness(np.asarray([F_true[i]], dtype=float), float(lam[i]))
+                        C[i] = float(Ci[0]) if np.size(Ci) > 0 else 0.0
+                    C = np.clip(C, 0.0, 1.0)
+                    keep = rng.uniform(0.0, 1.0, size=n_fake) < C
+                except Exception:
+                    # If selection evaluation fails, keep all to avoid crashing
+                    keep = np.ones(n_fake, dtype=bool)
+
+                if np.any(keep):
+                    ra = ra[keep]
+                    dec = dec[keep]
+                    lam = lam[keep]
+                    F_true = F_true[keep]
+                    F_err = F_err[keep]
+                    F_hat = F_hat[keep]
+
+                    ras.append(ra)
+                    decs.append(dec)
+                    classes.append(np.array(["fake"] * ra.size))
+                    lam_obs_list.append(lam)
+                    F_true_list.append(F_true)
+                    F_hat_list.append(F_hat)
+                    F_err_list.append(F_err)
             continue
 
         # Line-emitter labels (e.g., LAE, OII)
@@ -243,32 +352,92 @@ def simulate_catalog_from_model(
         rate, dVdz, dL2 = _rate_grid_per_sr(ctx, getattr(model, "lf"), ctx.selection, rest_wave, z_grid, F_grid)
 
         # Marginal over F to get rate over z
-        # Use trapezoidal integration along F axis
-        r_z = np.trapz(rate, x=F_grid, axis=1)  # shape (nz,)
+        r_z = integrate_rate_over_flux(rate, F_grid)  # shape (nz,)
 
         # Expected count over sky Ω: μ = Ω * ∫ r_z dz
-        mu_label = float(omega * np.trapz(r_z, x=z_grid))
+        mu_label = expected_count_from_rate(r_z, z_grid, omega)
         exp_counts[label_name] = float(mu_label)
         exp_counts["total"] += float(mu_label)
 
         # Comoving volume probed for this label (Ω × ∫ dV/dz dz)
-        V_label = float(omega * np.trapz(dVdz, x=z_grid))
+        V_label = expected_volume_from_dVdz(dVdz, z_grid, omega)
         label_volumes[label_name] = V_label
+
+        if ppp_debug:
+            # Estimate fraction of LF mass within bounds over the explored L range
+            try:
+                lf = getattr(model, "lf")
+                L_grid_sample = 4.0 * np.pi * dL2[int(len(dL2)//2)] * F_grid  # mid-z slice
+                phi_all = lf.phi(L_grid_sample)
+                mass_all = float(np.trapz(phi_all, x=L_grid_sample))
+                if getattr(lf, "Lmin", None) is not None or getattr(lf, "Lmax", None) is not None:
+                    mask = np.ones_like(L_grid_sample, dtype=bool)
+                    if getattr(lf, "Lmin", None) is not None:
+                        mask &= (L_grid_sample >= float(lf.Lmin))
+                    if getattr(lf, "Lmax", None) is not None:
+                        mask &= (L_grid_sample <= float(lf.Lmax))
+                    phi_masked = np.where(mask, phi_all, 0.0)
+                    mass_in = float(np.trapz(phi_masked, x=L_grid_sample))
+                    frac_in = (mass_in / mass_all) if (mass_all > 0) else np.nan
+                else:
+                    frac_in = 1.0
+            except Exception:
+                frac_in = np.nan
+            # Average selection over F and z (rough summary)
+            try:
+                lam_obs = rest_wave * (1.0 + z_grid)
+                S_avg = []
+                for i in range(len(z_grid)):
+                    S = ctx.selection.completeness(F_grid, float(lam_obs[i]))
+                    # weight by phi_F at this z for relevance
+                    dLdF_i = 4.0 * np.pi * dL2[i]
+                    Lg = 4.0 * np.pi * dL2[i] * F_grid
+                    phiF = getattr(model, "lf").phi(Lg) * dLdF_i
+                    w = phiF
+                    w_sum = np.sum(w)
+                    S_avg.append(float(np.sum(S * (w / w_sum))) if (np.isfinite(w_sum) and w_sum > 0) else float(np.mean(S)))
+                S_mean = float(np.mean(S_avg)) if len(S_avg) > 0 else float("nan")
+            except Exception:
+                S_mean = float("nan")
+            # Also compute the expected count without selection (diagnostic only)
+            try:
+                class _UnitSelection:
+                    def completeness(self, F, wave):
+                        return np.ones_like(F, dtype=float)
+                rate_nosel, _dVdz0, _dL20 = _rate_grid_per_sr(ctx, getattr(model, "lf"), _UnitSelection(), rest_wave, z_grid, F_grid)
+                r_z0 = integrate_rate_over_flux(rate_nosel, F_grid)
+                mu_nosel = expected_count_from_rate(r_z0, z_grid, omega)
+                S_eff = (mu_label / mu_nosel) if (np.isfinite(mu_nosel) and mu_nosel > 0) else np.nan
+            except Exception:
+                mu_nosel = float('nan')
+                S_eff = float('nan')
+            try:
+                log(f"[jlc.ppp.debug] label={label_name} Ω={omega:.3e} sr, λ_rest={rest_wave:.2f} Å, z∈[{zmin:.3f},{zmax:.3f}], V≈{V_label:.3e} Mpc^3, μ≈{mu_label:.3e}, μ0(no S)≈{mu_nosel:.3e}, S_eff≈{S_eff:.3f}, frac_LF_in_bounds≈{frac_in:.3f}, ⟨S⟩≈{S_mean:.3f}")
+            except Exception:
+                pass
+            debug_info.append({
+                "label": label_name,
+                "omega_sr": omega,
+                "rest_wave": rest_wave,
+                "zmin": float(zmin),
+                "zmax": float(zmax),
+                "V_Mpc3": V_label,
+                "mu": mu_label,
+                "mu_no_selection": mu_nosel,
+                "S_eff": S_eff,
+                "frac_LF_in_bounds": frac_in,
+                "S_mean": S_mean,
+            })
 
         n_label = _poisson_safe(rng, max(mu_label, 0.0))
         n_label = _cap_events(label_name, n_label, mu_label)
         if n_label <= 0:
             continue
 
-        # Build discrete sampling weights over z with Δz
-        # Use mid-point equivalent: weights = r_z * Δz normalized via choice with p
-        # For rng.choice we need probabilities; compute Δz approx
-        dz = np.gradient(z_grid)
-        w_z = r_z * dz
-        if np.sum(w_z) <= 0 or not np.isfinite(np.sum(w_z)):
+        # Sample redshifts proportionally to r(z) Δz
+        idx_z, p_z = sample_z_indices(rng, z_grid, r_z, n_label)
+        if idx_z.size == 0:
             continue
-        p_z = w_z / np.sum(w_z)
-        idx_z = rng.choice(z_grid.size, size=n_label, p=p_z)
         z_samp = z_grid[idx_z]
         lam_obs = rest_wave * (1.0 + z_samp)
 
@@ -276,34 +445,25 @@ def simulate_catalog_from_model(
         F_samp = np.empty(n_label, dtype=float)
         for k in range(n_label):
             i = idx_z[k]
-            rF = rate[i, :].copy()
-            # Multiply by ΔF for proper mass; use trapezoid weights
-            # Approximate ΔF via gradient
-            dF = np.gradient(F_grid)
-            wF = rF * dF
-            s = np.sum(wF)
-            if not np.isfinite(s) or s <= 0:
-                # Fallback: pick from F_grid uniformly
-                F_samp[k] = float(F_grid[int(rng.integers(0, F_grid.size))])
-            else:
-                pF = wF / s
-                idxF = int(rng.choice(F_grid.size, p=pF))
-                F_samp[k] = float(F_grid[idxF])
+            F_samp[k] = sample_F_given_z(rng, rate[i, :], F_grid)
 
         # Observational noise
         F_err = np.full(n_label, float(flux_err))
         F_hat = np.clip(F_samp + rng.normal(0.0, F_err), 0.0, None)
 
-        # Sky positions uniform
+        # Sky positions: RA uniform; DEC sampled to be uniform per steradian via sin(dec) transform
         ra = rng.uniform(ra_low, ra_high, size=n_label)
-        dec = rng.uniform(dec_low, dec_high, size=n_label)
+        s1 = np.sin(np.deg2rad(dec_low)); s2 = np.sin(np.deg2rad(dec_high))
+        u = rng.uniform(min(s1, s2), max(s1, s2), size=n_label)
+        dec = np.rad2deg(np.arcsin(u))
 
         # Append
         ras.append(ra)
         decs.append(dec)
         classes.append(np.array([label_name] * n_label))
         lam_obs_list.append(lam_obs)
-        F_true_list.append(F_hat)
+        F_true_list.append(F_samp)
+        F_hat_list.append(F_hat)
         F_err_list.append(F_err)
 
     # Concatenate all
@@ -313,6 +473,9 @@ def simulate_catalog_from_model(
             if hasattr(ctx, "config") and isinstance(ctx.config, dict):
                 ctx.config["ppp_expected_counts"] = dict(exp_counts)
                 ctx.config["ppp_label_volumes"] = dict(label_volumes)
+                # Optionally attach detailed PPP debug info for downstream diagnostics
+                if bool(getattr(ctx, "config", {}).get("ppp_debug", False)):
+                    ctx.config["ppp_debug_info"] = list(debug_info)
         except Exception:
             pass
         # Print expectations even if no objects realized
@@ -323,17 +486,18 @@ def simulate_catalog_from_model(
             lae_V = label_volumes.get("lae", float("nan"))
             oii_V = label_volumes.get("oii", float("nan"))
             total_mu = exp_counts.get("total", 0.0)
-            print(f"[jlc.simulate] Expected counts: lae≈{lae_mu:.3e}, oii≈{oii_mu:.3e}, fake≈{fake_mu:.3e}; total≈{total_mu:.3e}")
-            print(f"[jlc.simulate] Volumes (Mpc^3): lae≈{lae_V:.3e}, oii≈{oii_V:.3e}")
+            log(f"[jlc.simulate] Expected counts (incl. selection for LAE/OII; fakes from ρ over band): lae≈{lae_mu:.3e}, oii≈{oii_mu:.3e}, fake≈{fake_mu:.3e}; total≈{total_mu:.3e}")
+            log(f"[jlc.simulate] Volumes (Mpc^3): lae≈{lae_V:.3e}, oii≈{oii_V:.3e}")
         except Exception:
             pass
-        return pd.DataFrame(columns=["ra", "dec", "true_class", "wave_obs", "flux_hat", "flux_err"]).copy()
+        return pd.DataFrame(columns=["ra", "dec", "true_class", "wave_obs", "flux_true", "flux_hat", "flux_err"]).copy()
 
     ra_all = np.concatenate(ras)
     dec_all = np.concatenate(decs)
     cls_all = np.concatenate(classes)
     lam_all = np.concatenate(lam_obs_list)
-    Fhat_all = np.concatenate(F_true_list)
+    Ftrue_all = np.concatenate(F_true_list)
+    Fhat_all = np.concatenate(F_hat_list)
     Ferr_all = np.concatenate(F_err_list)
 
     df = pd.DataFrame({
@@ -341,15 +505,32 @@ def simulate_catalog_from_model(
         "dec": dec_all,
         "true_class": cls_all,
         "wave_obs": lam_all,
+        "flux_true": Ftrue_all,
         "flux_hat": Fhat_all,
         "flux_err": Ferr_all,
     })
+
+    # Compute S/N and apply S/N filter if requested
+    with np.errstate(divide='ignore', invalid='ignore'):
+        snr = np.where(df["flux_err"].values > 0, df["flux_hat"].values / df["flux_err"].values, 0.0)
+    df["snr"] = snr
+    if snr_min is not None and np.isfinite(snr_min) and snr_min > 0:
+        before = len(df)
+        df = df.loc[df["snr"] >= float(snr_min)].reset_index(drop=True)
+        after = len(df)
+        try:
+            log(f"[jlc.simulate] Applied S/N cut: snr_min={snr_min:.2f}. Kept {after}/{before} rows ({(after/max(before,1))*100:.1f}%).")
+        except Exception:
+            pass
 
     # Expose expected counts and volumes in context for downstream use
     try:
         if hasattr(ctx, "config") and isinstance(ctx.config, dict):
             ctx.config["ppp_expected_counts"] = dict(exp_counts)
             ctx.config["ppp_label_volumes"] = dict(label_volumes)
+            # Optionally attach detailed PPP debug info for downstream diagnostics
+            if bool(getattr(ctx, "config", {}).get("ppp_debug", False)):
+                ctx.config["ppp_debug_info"] = list(debug_info)
     except Exception:
         pass
 
@@ -361,8 +542,8 @@ def simulate_catalog_from_model(
         lae_V = label_volumes.get("lae", float("nan"))
         oii_V = label_volumes.get("oii", float("nan"))
         total_mu = exp_counts.get("total", 0.0)
-        print(f"[jlc.simulate] Expected counts: lae≈{lae_mu:.3e}, oii≈{oii_mu:.3e}, fake≈{fake_mu:.3e}; total≈{total_mu:.3e}")
-        print(f"[jlc.simulate] Volumes (Mpc^3): lae≈{lae_V:.3e}, oii≈{oii_V:.3e}")
+        log(f"[jlc.simulate] Expected counts (incl. selection for LAE/OII; fakes from ρ over band): lae≈{lae_mu:.3e}, oii≈{oii_mu:.3e}, fake≈{fake_mu:.3e}; total≈{total_mu:.3e}")
+        log(f"[jlc.simulate] Volumes (Mpc^3): lae≈{lae_V:.3e}, oii≈{oii_V:.3e}")
     except Exception:
         pass
 
