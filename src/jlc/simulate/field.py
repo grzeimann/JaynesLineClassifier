@@ -117,16 +117,6 @@ def simulate_field(
         if len(df_final) > 1:
             df_final = df_final.sample(frac=1.0, random_state=rng.integers(0, 2**32 - 1)).reset_index(drop=True)
 
-    # Attach and log diagnostics similarly to legacy PPP
-    try:
-        if hasattr(ctx, "config") and isinstance(ctx.config, dict):
-            ctx.config["ppp_expected_counts"] = dict(exp_counts)
-            ctx.config["ppp_label_volumes"] = dict(label_volumes)
-            if ppp_debug:
-                ctx.config["ppp_debug_info"] = list(debug_info)
-    except Exception:
-        pass
-
     try:
         lae_mu = exp_counts.get("lae", 0.0)
         oii_mu = exp_counts.get("oii", 0.0)

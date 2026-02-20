@@ -1,11 +1,8 @@
 import numpy as np
 import pandas as pd
 from .base import LabelModel
-from jlc.types import EvidenceResult
 from jlc.population.schechter import SchechterLF
 
-# Cosmology returns d_L in Mpc; convert to cm for L = 4π d_L^2 F in CGS.
-MPC_TO_CM = 3.085677581491367e24
 
 
 class LAELabel(LabelModel):
@@ -24,38 +21,9 @@ class LAELabel(LabelModel):
         self.measurement_modules = list(measurement_modules)
 
     def rate_density(self, row: pd.Series, ctx) -> float:
-        # Observed-space rate per sr per Å at the row's wavelength, integrated over F
-        # Respect virtual-volume mode: no physical sources in virtual runs
-        try:
-            if str(getattr(ctx, "config", {}).get("volume_mode", "real")).lower() == "virtual":
-                return 0.0
-        except Exception:
-            pass
-        lam = float(row.get("wave_obs", np.nan))
-        if not np.isfinite(lam) or lam <= 0:
-            return 0.0
-        z = lam / self.rest_wave - 1.0
-        if not np.isfinite(z) or z <= 0:
-            return 0.0
-        F_grid, _ = ctx.caches["flux_grid"].grid(row)
-        dL = ctx.cosmo.luminosity_distance(z)  # Mpc
-        dL_cm = dL * MPC_TO_CM
-        dVdz = ctx.cosmo.dV_dz(z)  # Mpc^3 / sr / dz
-        dLdF = 4 * np.pi * (dL_cm ** 2)
-        L_grid = 4 * np.pi * (dL_cm ** 2) * F_grid
-        phi = self.lf.phi(L_grid)
-        S = self.selection.completeness(F_grid, lam)
-        jac = 1.0 / self.rest_wave  # |dz/dλ|
-        rF = dVdz * (phi * dLdF) * S * jac  # per sr per Å per flux
-        # integrate over F to get per sr per Å
-        r = float(np.trapz(rF, x=F_grid))
-        # apply effective search measure (dimensionless multiplier)
-        try:
-            from jlc.rates.observed_space import effective_search_measure
-            r *= float(effective_search_measure(row, ctx))
-        except Exception:
-            pass
-        return max(r, 0.0)
+        # Use shared helper for observed-space rate density integration (per sr per Å)
+        from jlc.core.population_helpers import rate_density_local
+        return float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection))
 
     def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
         """Measurement-only evidence marginalized over latent flux (neutral prior on F)."""
@@ -72,20 +40,6 @@ class LAELabel(LabelModel):
             log_like[k] = ll
         logZ = ctx.caches["flux_grid"].logsumexp(log_like + log_w)
         return float(logZ)
-
-    def log_evidence(self, row: pd.Series, ctx) -> EvidenceResult:
-        # Deprecated shim: emit warning and wrap extra_log_likelihood in EvidenceResult
-        import warnings as _warnings
-        _warnings.warn(
-            "LAELabel.log_evidence is deprecated; use extra_log_likelihood() and engine posterior combination",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        z = float(row.get("wave_obs", np.nan)) / self.rest_wave - 1.0
-        ell = self.extra_log_likelihood(row, ctx)
-        if not np.isfinite(z) or z <= 0:
-            return EvidenceResult(self.label, -np.inf, {"reason": "z<=0 or invalid"})
-        return EvidenceResult(self.label, float(ell), {"z": float(z)})
 
     # --- New per-label simulator (engine-aligned) ---
     def simulate_catalog(
