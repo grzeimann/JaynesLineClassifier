@@ -144,17 +144,6 @@ class FakeLabel(LabelModel):
         logZ = ctx.caches["flux_grid"].logsumexp(log_like + log_w)
         return float(logZ)
 
-    def log_evidence(self, row: pd.Series, ctx) -> EvidenceResult:
-        # Deprecated shim: emit warning and wrap extra_log_likelihood in EvidenceResult
-        import warnings as _warnings
-        _warnings.warn(
-            "FakeLabel.log_evidence is deprecated; use extra_log_likelihood() and engine posterior combination",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        ell = self.extra_log_likelihood(row, ctx)
-        return EvidenceResult(self.label, float(ell), {})
-
     # --- New per-label simulator (engine-aligned) ---
     def simulate_catalog(
         self,

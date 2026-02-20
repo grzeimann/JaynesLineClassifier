@@ -204,27 +204,45 @@ def rate_density_local(
         except Exception:
             pass
         return max(r, 0.0)
-    # Build a local F_true grid centered on F_hat covering several sigmas
+    # Build true-flux grid: prefer shared FluxGrid for consistency; fallback to local grid
+    used_fluxgrid = False
+    F_grid_true = None
     try:
-        cfg = getattr(ctx, "config", {}) or {}
-        nsig = float(cfg.get("flux_marg_nsigma", 6.0) or 6.0)
+        fg = getattr(getattr(ctx, "caches", {}), "get", lambda k, d=None: None)("flux_grid") if hasattr(getattr(ctx, "caches", {}), "get") else getattr(ctx.caches, "flux_grid", None)
+        if fg is None:
+            fg = getattr(ctx.caches if hasattr(ctx, "caches") else {}, "flux_grid", None)
+        if fg is not None and hasattr(fg, "grid"):
+            Fg, _logw = fg.grid(row)
+            Fg = np.asarray(Fg, dtype=float)
+            # sanitize: keep finite and non-negative
+            Fg = Fg[np.isfinite(Fg) & (Fg >= 0.0)]
+            if Fg.size >= 2:
+                F_grid_true = Fg
+                used_fluxgrid = True
     except Exception:
-        nsig = 6.0
-    nsig = 6.0 if not np.isfinite(nsig) or nsig <= 0 else float(nsig)
-    F_min = max(0.0, F_hat - nsig * sigma)
-    F_max = F_hat + nsig * sigma
-    # Ensure non-degenerate span; extend if necessary
-    span = F_max - F_min
-    if not (np.isfinite(span) and span > 0):
-        F_min = max(0.0, F_hat)
-        F_max = F_min + max(sigma, 1e-30)
-    # Number of grid points (can be tuned via config)
-    try:
-        Nf = int(getattr(ctx, "config", {}).get("flux_marg_npts", 256) or 256)
-    except Exception:
-        Nf = 256
-    Nf = max(int(Nf), 16)
-    F_grid_true = np.linspace(F_min, F_max, Nf, dtype=float)
+        pass
+    if F_grid_true is None:
+        # Fallback: local F_true grid centered on F_hat covering several sigmas
+        try:
+            cfg = getattr(ctx, "config", {}) or {}
+            nsig = float(cfg.get("flux_marg_nsigma", 6.0) or 6.0)
+        except Exception:
+            nsig = 6.0
+        nsig = 6.0 if not np.isfinite(nsig) or nsig <= 0 else float(nsig)
+        F_min = max(0.0, F_hat - nsig * sigma)
+        F_max = F_hat + nsig * sigma
+        # Ensure non-degenerate span; extend if necessary
+        span = F_max - F_min
+        if not (np.isfinite(span) and span > 0):
+            F_min = max(0.0, F_hat)
+            F_max = F_min + max(sigma, 1e-30)
+        # Number of grid points (can be tuned via config)
+        try:
+            Nf = int(getattr(ctx, "config", {}).get("flux_marg_npts", 256) or 256)
+        except Exception:
+            Nf = 256
+        Nf = max(int(Nf), 16)
+        F_grid_true = np.linspace(F_min, F_max, Nf, dtype=float)
     # Evaluate LF×selection integrand r_F(F_true, λ)
     rF, _dVdz, _dL2 = rate_density_integrand_per_flux(lf, selection, F_grid_true, lam, rest_wave, z, ctx.cosmo)
     # Measurement PDF p(F_hat | F_true) assuming Gaussian noise on flux_hat
@@ -244,46 +262,3 @@ def rate_density_local(
         pass
     return max(r, 0.0)
 
-
-# ----------------------- PPP grid helpers (optional) -----------------------
-
-def build_z_grid_from_band(rest_wave: float, wave_min: float, wave_max: float, nz: int) -> Tuple[np.ndarray, float, float]:
-    """Construct a monotonic redshift grid covering [wave_min, wave_max].
-
-    Returns (z_grid, zmin, zmax). If inputs invalid, returns (None, nan, nan).
-    """
-    try:
-        wmin = float(wave_min); wmax = float(wave_max); rw = float(rest_wave)
-        if not (np.isfinite(wmin) and np.isfinite(wmax) and np.isfinite(rw)):
-            return None, float("nan"), float("nan")
-        if wmax <= wmin or rw <= 0:
-            return None, float("nan"), float("nan")
-        zmin = max(wmin / rw - 1.0, 0.0)
-        zmax = max(wmax / rw - 1.0, 0.0)
-        z_grid = np.linspace(zmin, zmax, int(max(nz, 2)))
-        return z_grid, float(zmin), float(zmax)
-    except Exception:
-        return None, float("nan"), float("nan")
-
-
-def rate_grid_per_sr_over_zF(ctx, lf, selection, rest_wave: float, z_grid: np.ndarray, F_grid: np.ndarray):
-    """Build rate grid r[z,F] per (sr·Å·flux) and return (rate, dVdz, dL2) arrays.
-
-    Shapes:
-      rate: (Nz, Nf)
-      dVdz: (Nz,)
-      dL2:  (Nz,)
-    """
-    z_grid = np.asarray(z_grid, dtype=float)
-    F_grid = np.asarray(F_grid, dtype=float)
-    Nz, Nf = z_grid.size, F_grid.size
-    rate = np.zeros((Nz, Nf), dtype=float)
-    dVdz = np.zeros(Nz, dtype=float)
-    dL2 = np.zeros(Nz, dtype=float)
-    for i, z in enumerate(z_grid):
-        lam = rest_wave * (1.0 + z)
-        rF, dv, dl2 = rate_density_integrand_per_flux(lf, selection, F_grid, lam, rest_wave, z, ctx.cosmo)
-        rate[i, :] = rF
-        dVdz[i] = dv
-        dL2[i] = dl2
-    return rate, dVdz, dL2
