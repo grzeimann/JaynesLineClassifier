@@ -15,8 +15,7 @@ from jlc.population.schechter import SchechterLF
 from jlc.cosmology.lookup import AstropyCosmology
 from jlc.selection.base import SelectionModel
 from jlc.measurements.flux import FluxMeasurement
-from jlc.simulate.simple import SkyBox, simulate_catalog, plot_distributions, plot_selection_completeness
-from jlc.simulate import simulate_catalog_from_model
+from jlc.simulate.simple import SkyBox, plot_distributions, plot_selection_completeness
 from jlc.simulate.field import simulate_field as simulate_field_api
 from jlc.utils.logging import log
 from jlc.utils.cli_helpers import load_ra_dec_factor, load_completeness_tables
@@ -25,11 +24,6 @@ from jlc.utils.cli_helpers import load_ra_dec_factor, load_completeness_tables
 FLUXGRID_DEFAULT_MIN = 1e-18
 FLUXGRID_DEFAULT_MAX = 1e-14
 FLUXGRID_DEFAULT_N = 128
-
-
-
-
-
 
 def build_default_context_and_registry(f_lim: float | None = None, wave_min: float | None = None, wave_max: float | None = None, volume_mode: str | None = None,
                                         n_fibers: int | None = None, ifu_count: int | None = None, exposure_scale: float | None = None,
@@ -142,347 +136,88 @@ def cmd_simulate(args) -> int:
 
     # Optional completeness tables
     F50_table, w_table = load_completeness_tables(args, caller="jlc.simulate")
-    # Placeholder for optional fake-rate validation summary
-    fake_rate_validation_result = None
 
-    # Optionally build empirical fake λ-PDF cache from calibration CSV
-    fake_lambda_cache = None
-    # Option 1: build from calibration CSV
-    if getattr(args, "fake_lambda_calib", None):
+    # Optional: calibrate a homogeneous fake rate ρ̂ from a virtual catalog
+    if getattr(args, "calibrate_fake_rate_from", None):
         try:
-            calib_df = pd.read_csv(args.fake_lambda_calib)
-            from jlc.rates.observed_space import build_fake_lambda_pdf, save_fake_lambda_cache
-            fake_lambda_cache = build_fake_lambda_pdf(
-                calib_df.get("wave_obs", pd.Series(dtype=float)).values,
-                wave_min=args.wave_min,
-                wave_max=args.wave_max,
-                nbins=args.fake_lambda_nbins,
+            calib_df = pd.read_csv(args.calibrate_fake_rate_from)
+            from jlc.rates.observed_space import calibrate_fake_rate_from_catalog
+            rho_hat = calibrate_fake_rate_from_catalog(
+                calib_df,
+                ra_low=args.ra_low, ra_high=args.ra_high,
+                dec_low=args.dec_low, dec_high=args.dec_high,
+                wave_min=args.wave_min, wave_max=args.wave_max,
             )
-            if getattr(args, "fake_lambda_cache_out", None):
-                try:
-                    save_fake_lambda_cache(args.fake_lambda_cache_out, fake_lambda_cache)
-                    log(f"[jlc.simulate] Saved fake λ-PDF cache to {args.fake_lambda_cache_out}")
-                except Exception as ee:
-                    log(f"[jlc.simulate] Warning: failed to save fake λ-PDF cache to {args.fake_lambda_cache_out}: {ee}")
+            if np.isfinite(rho_hat) and rho_hat > 0:
+                log(f"[jlc.simulate] Calibrated fake rate ρ̂ ≈ {rho_hat:.6e} (1/(sr·Å)) from {args.calibrate_fake_rate_from}; overriding --fake-rate")
+                args.fake_rate = float(rho_hat)
+            else:
+                log("[jlc.simulate] Warning: calibrated fake rate was non-positive or invalid; keeping provided --fake-rate value")
         except Exception as e:
-            log(f"[jlc.simulate] Warning: failed to build fake λ-PDF from {args.fake_lambda_calib}: {e}")
-            fake_lambda_cache = None
-    # Option 2: load from a precomputed cache file if not built above
-    if fake_lambda_cache is None and getattr(args, "fake_lambda_cache_in", None):
-        try:
-            from jlc.rates.observed_space import load_fake_lambda_cache
-            fake_lambda_cache = load_fake_lambda_cache(args.fake_lambda_cache_in)
-        except Exception as e:
-            log(f"[jlc.simulate] Warning: failed to load fake λ-PDF cache from {args.fake_lambda_cache_in}: {e}")
-            fake_lambda_cache = None
+            log(f"[jlc.simulate] Warning: failed to calibrate fake rate from {args.calibrate_fake_rate_from}: {e}")
 
-    if args.from_model:
-        # Optional: calibrate a homogeneous fake rate ρ̂ from a virtual catalog
-        if getattr(args, "calibrate_fake_rate_from", None):
-            try:
-                calib_df = pd.read_csv(args.calibrate_fake_rate_from)
-                from jlc.rates.observed_space import calibrate_fake_rate_from_catalog
-                rho_hat = calibrate_fake_rate_from_catalog(
-                    calib_df,
-                    ra_low=args.ra_low, ra_high=args.ra_high,
-                    dec_low=args.dec_low, dec_high=args.dec_high,
-                    wave_min=args.wave_min, wave_max=args.wave_max,
-                )
-                if np.isfinite(rho_hat) and rho_hat > 0:
-                    log(f"[jlc.simulate] Calibrated fake rate ρ̂ ≈ {rho_hat:.6e} (1/(sr·Å)) from {args.calibrate_fake_rate_from}; overriding --fake-rate")
-                    args.fake_rate = float(rho_hat)
-                else:
-                    log("[jlc.simulate] Warning: calibrated fake rate was non-positive or invalid; keeping provided --fake-rate value")
-            except Exception as e:
-                log(f"[jlc.simulate] Warning: failed to calibrate fake rate from {args.calibrate_fake_rate_from}: {e}")
-        # Optional: validate provided or calibrated fake rate against a virtual catalog
-        if getattr(args, "validate_fake_rate_from", None):
-            try:
-                vdf = pd.read_csv(args.validate_fake_rate_from)
-                from jlc.rates.observed_space import validate_fake_rate_against_catalog
-                val = validate_fake_rate_against_catalog(
-                    vdf,
-                    rho=float(args.fake_rate),
-                    ra_low=args.ra_low, ra_high=args.ra_high,
-                    dec_low=args.dec_low, dec_high=args.dec_high,
-                    wave_min=args.wave_min, wave_max=args.wave_max,
-                )
-                log(f"[jlc.simulate] Fake-rate validation: N_obs={val['N_obs']:.0f}, N_exp={val['N_exp']:.1f}, rel_err={val['rel_err']:.3f}, passed={val['passed']}")
-                # stash; ctx not yet built, capture locally and attach later
-                fake_rate_validation_result = dict(val)
-            except Exception as e:
-                log(f"[jlc.simulate] Warning: fake-rate validation failed: {e}")
-        # Build context/registry first for model-driven PPP
-        ra_dec_fn = load_ra_dec_factor(getattr(args, "ra_dec_factor", None))
-        ctx, registry = build_default_context_and_registry(
-            f_lim=args.f_lim,
-            wave_min=args.wave_min,
-            wave_max=args.wave_max,
-            volume_mode=args.volume_mode,
-            n_fibers=getattr(args, "n_fibers", None),
-            ifu_count=getattr(args, "ifu_count", None),
-            exposure_scale=getattr(args, "exposure_scale", None),
-            search_measure_scale=getattr(args, "search_measure_scale", None),
-            F50=getattr(args, "F50", None),
-            w=getattr(args, "w", None),
-            F50_table=F50_table,
-            w_table=w_table,
-            fluxgrid_min=getattr(args, "fluxgrid_min", None),
-            fluxgrid_max=getattr(args, "fluxgrid_max", None),
-            fluxgrid_n=getattr(args, "fluxgrid_n", None),
-            ra_dec_factor=ra_dec_fn,
-        )
-        # Attach any pre-built validation result now that we have a context
-        try:
-            if fake_rate_validation_result is not None and isinstance(ctx.config, dict):
-                ctx.config["fake_rate_validation"] = dict(fake_rate_validation_result)
-        except Exception:
-            pass
-        # Apply prior toggles and debug flag to context config
-        try:
-            if isinstance(ctx.config, dict):
-                ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
-                ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
-                ctx.config["ppp_debug"] = bool(getattr(args, "ppp_debug", False))
-        except Exception:
-            pass
-        # Attach empirical fake λ-PDF cache if available
-        if fake_lambda_cache is not None:
-            try:
-                ctx.caches["fake_lambda_pdf"] = fake_lambda_cache
-            except Exception:
-                pass
-        # Propagate fake rate into context config for rate-density prior use
-        try:
-            if isinstance(ctx.config, dict):
-                ctx.config["fake_rate_per_sr_per_A"] = float(args.fake_rate)
-                ctx.config["fake_rate_rho_used"] = float(args.fake_rate)
-        except Exception:
-            pass
-        # Record snr_min in context for traceability
-        try:
-            if isinstance(ctx.config, dict) and getattr(args, "snr_min", None) is not None:
-                ctx.config["snr_min"] = float(args.snr_min)
-        except Exception:
-            pass
-        # Optional parity check between engine-aligned and legacy PPP backends
-        if bool(getattr(args, "ppp_parity_check", False)):
-            try:
-                # Build independent contexts/registries to avoid cross-contamination of ctx.config
-                ctx_eng, reg_eng = build_default_context_and_registry(
-                    f_lim=args.f_lim,
-                    wave_min=args.wave_min,
-                    wave_max=args.wave_max,
-                    volume_mode=args.volume_mode,
-                    n_fibers=getattr(args, "n_fibers", None),
-                    ifu_count=getattr(args, "ifu_count", None),
-                    exposure_scale=getattr(args, "exposure_scale", None),
-                    search_measure_scale=getattr(args, "search_measure_scale", None),
-                    F50=getattr(args, "F50", None),
-                    w=getattr(args, "w", None),
-                    F50_table=F50_table,
-                    w_table=w_table,
-                    fluxgrid_min=getattr(args, "fluxgrid_min", None),
-                    fluxgrid_max=getattr(args, "fluxgrid_max", None),
-                    fluxgrid_n=getattr(args, "fluxgrid_n", None),
-                    ra_dec_factor=ra_dec_fn,
-                )
-                if isinstance(ctx_eng.config, dict):
-                    ctx_eng.config["ppp_debug"] = False
-                _ = simulate_field_api(
-                    registry=reg_eng,
-                    ctx=ctx_eng,
-                    ra_low=args.ra_low,
-                    ra_high=args.ra_high,
-                    dec_low=args.dec_low,
-                    dec_high=args.dec_high,
-                    wave_min=args.wave_min,
-                    wave_max=args.wave_max,
-                    flux_err=args.flux_err,
-                    f_lim=args.f_lim,
-                    fake_rate_per_sr_per_A=args.fake_rate,
-                    seed=args.seed,
-                    nz=args.nz,
-                    snr_min=getattr(args, "snr_min", None),
-                )
-                mu_eng = (getattr(ctx_eng, "config", {}) or {}).get("ppp_expected_counts", {})
-                V_eng = (getattr(ctx_eng, "config", {}) or {}).get("ppp_label_volumes", {})
+    # Build context/registry first for model-driven PPP
+    ra_dec_fn = load_ra_dec_factor(getattr(args, "ra_dec_factor", None))
+    ctx, registry = build_default_context_and_registry(
+        f_lim=args.f_lim,
+        wave_min=args.wave_min,
+        wave_max=args.wave_max,
+        volume_mode=args.volume_mode,
+        n_fibers=getattr(args, "n_fibers", None),
+        ifu_count=getattr(args, "ifu_count", None),
+        exposure_scale=getattr(args, "exposure_scale", None),
+        search_measure_scale=getattr(args, "search_measure_scale", None),
+        F50=getattr(args, "F50", None),
+        w=getattr(args, "w", None),
+        F50_table=F50_table,
+        w_table=w_table,
+        fluxgrid_min=getattr(args, "fluxgrid_min", None),
+        fluxgrid_max=getattr(args, "fluxgrid_max", None),
+        fluxgrid_n=getattr(args, "fluxgrid_n", None),
+        ra_dec_factor=ra_dec_fn,
+    )
 
-                ctx_leg, reg_leg = build_default_context_and_registry(
-                    f_lim=args.f_lim,
-                    wave_min=args.wave_min,
-                    wave_max=args.wave_max,
-                    volume_mode=args.volume_mode,
-                    n_fibers=getattr(args, "n_fibers", None),
-                    ifu_count=getattr(args, "ifu_count", None),
-                    exposure_scale=getattr(args, "exposure_scale", None),
-                    search_measure_scale=getattr(args, "search_measure_scale", None),
-                    F50=getattr(args, "F50", None),
-                    w=getattr(args, "w", None),
-                    F50_table=F50_table,
-                    w_table=w_table,
-                    fluxgrid_min=getattr(args, "fluxgrid_min", None),
-                    fluxgrid_max=getattr(args, "fluxgrid_max", None),
-                    fluxgrid_n=getattr(args, "fluxgrid_n", None),
-                )
-                if isinstance(ctx_leg.config, dict):
-                    ctx_leg.config["ppp_debug"] = False
-                _ = simulate_catalog_from_model(
-                    ctx=ctx_leg,
-                    registry=reg_leg,
-                    ra_low=args.ra_low,
-                    ra_high=args.ra_high,
-                    dec_low=args.dec_low,
-                    dec_high=args.dec_high,
-                    wave_min=args.wave_min,
-                    wave_max=args.wave_max,
-                    flux_err=args.flux_err,
-                    f_lim=args.f_lim,
-                    fake_rate_per_sr_per_A=args.fake_rate,
-                    seed=args.seed,
-                    nz=args.nz,
-                    snr_min=getattr(args, "snr_min", None),
-                )
-                mu_leg = (getattr(ctx_leg, "config", {}) or {}).get("ppp_expected_counts", {})
-                V_leg = (getattr(ctx_leg, "config", {}) or {}).get("ppp_label_volumes", {})
-                # Compare with tolerances and log, and store a machine-readable summary
-                rtol = float(getattr(args, "parity_rtol", 1e-3))
-                atol = float(getattr(args, "parity_atol", 0.0))
-                labels_to_check = ["lae", "oii", "fake", "total"]
-                counts_ok = {}
-                vols_ok = {}
-                for key in labels_to_check:
-                    a = float(mu_eng.get(key, 0.0))
-                    b = float(mu_leg.get(key, 0.0))
-                    rel = (abs(a - b) / max(abs(b), 1e-12)) if np.isfinite(b) else float('nan')
-                    ok = (np.isfinite(a) and np.isfinite(b) and np.isclose(a, b, rtol=rtol, atol=atol)) or (a == b == 0.0)
-                    counts_ok[key] = bool(ok)
-                    try:
-                        log(f"[jlc.simulate] PPP parity μ[{key}]: engine≈{a:.3e}, legacy≈{b:.3e}, relΔ≈{(rel*100.0 if np.isfinite(rel) else float('nan')):.2f}%, ok={ok}")
-                    except Exception:
-                        pass
-                for key in ["lae", "oii"]:
-                    a = float(V_eng.get(key, 0.0))
-                    b = float(V_leg.get(key, 0.0))
-                    rel = (abs(a - b) / max(abs(b), 1e-12)) if np.isfinite(b) else float('nan')
-                    ok = (np.isfinite(a) and np.isfinite(b) and np.isclose(a, b, rtol=rtol, atol=atol)) or (a == b == 0.0)
-                    vols_ok[key] = bool(ok)
-                    try:
-                        log(f"[jlc.simulate] PPP parity V[{key}]: engine≈{a:.3e}, legacy≈{b:.3e}, relΔ≈{(rel*100.0 if np.isfinite(rel) else float('nan')):.2f}%, ok={ok}")
-                    except Exception:
-                        pass
-                # Emit a compact summary table to the log for quick scanning
-                try:
-                    hdr = "label   | mu(ok) | V(ok)"
-                    log(f"[jlc.simulate] PPP parity summary\n{hdr}\n" + "-"*len(hdr))
-                    for key in labels_to_check:
-                        mu_ok = counts_ok.get(key, True)
-                        v_ok = vols_ok.get(key, True) if key in vols_ok else True
-                        log(f"[jlc.simulate] {key:6s} | {'OK' if mu_ok else 'FAIL':>5s} | {'OK' if v_ok else '  --'}")
-                except Exception:
-                    pass
+    # Apply prior toggles and debug flag to context config
+    try:
+        if isinstance(ctx.config, dict):
+            ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
+            ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
+            ctx.config["ppp_debug"] = bool(getattr(args, "ppp_debug", False))
+    except Exception:
+        pass
 
-                summary = {
-                    "rtol": rtol,
-                    "atol": atol,
-                    "counts_ok": counts_ok,
-                    "vols_ok": vols_ok,
-                    "mu_engine": mu_eng,
-                    "mu_legacy": mu_leg,
-                    "V_engine": V_eng,
-                    "V_legacy": V_leg,
-                }
-                # Optionally persist a JSON report for downstream automation
-                try:
-                    if isinstance(ctx.config, dict):
-                        ctx.config["ppp_parity_summary"] = summary
-                except Exception:
-                    pass
-                if getattr(args, "parity_report", None):
-                    try:
-                        import json
-                        with open(args.parity_report, "w") as f:
-                            json.dump(summary, f, indent=2, sort_keys=True)
-                        log(f"[jlc.simulate] Wrote PPP parity report to {args.parity_report}")
-                    except Exception as e:
-                        log(f"[jlc.simulate] Warning: failed to write parity report to {getattr(args, 'parity_report', None)}: {e}")
-                if all(counts_ok.values()) and all(vols_ok.get(k, True) for k in vols_ok.keys()):
-                    try:
-                        log(f"[jlc.simulate] PPP parity check PASSED within tolerances (rtol={rtol}, atol={atol}).")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        log(f"[jlc.simulate] PPP parity check FAILED within tolerances (rtol={rtol}, atol={atol}). See ctx.config['ppp_parity_summary'] for details.")
-                    except Exception:
-                        pass
-            except Exception as e:
-                log(f"[jlc.simulate] Warning: PPP parity check failed: {e}")
+    # Propagate fake rate into context config for rate-density prior use
+    try:
+        if isinstance(ctx.config, dict):
+            ctx.config["fake_rate_per_sr_per_A"] = float(args.fake_rate)
+            ctx.config["fake_rate_rho_used"] = float(args.fake_rate)
+    except Exception:
+        pass
+    # Record snr_min in context for traceability
+    try:
+        if isinstance(ctx.config, dict) and getattr(args, "snr_min", None) is not None:
+            ctx.config["snr_min"] = float(args.snr_min)
+    except Exception:
+        pass
 
-        # Choose simulation backend: engine-aligned simulate_field() is now the only supported path.
-        # Legacy PPP path has been removed after parity validation; keep a one-release shim that errors with guidance.
-        if bool(getattr(args, "legacy_ppp", False)):
-            log("[jlc.simulate] ERROR: --legacy-ppp has been removed. Use the engine-aligned simulator (default).\n"
-                "              If you need the old behavior, please pin to an older version or open an issue.")
-            return 2
-        log("[jlc.simulate] Using engine-aligned simulate_field() API (new architecture source of truth)")
-        df = simulate_field_api(
-            registry=registry,
-            ctx=ctx,
-            ra_low=args.ra_low,
-            ra_high=args.ra_high,
-            dec_low=args.dec_low,
-            dec_high=args.dec_high,
-            wave_min=args.wave_min,
-            wave_max=args.wave_max,
-            flux_err=args.flux_err,
-            f_lim=args.f_lim,
-            fake_rate_per_sr_per_A=args.fake_rate,
-            seed=args.seed,
-            nz=args.nz,
-            snr_min=getattr(args, "snr_min", None),
-        )
-    else:
-        # Simple fraction-based simulator
-        class_fracs = {"lae": args.lae_frac, "oii": args.oii_frac, "fake": args.fake_frac}
-        df = simulate_catalog(
-            n=args.n,
-            sky=sky,
-            f_lim=args.f_lim,
-            class_fracs=class_fracs,
-            wave_min=args.wave_min,
-            wave_max=args.wave_max,
-            flux_err=args.flux_err,
-            seed=args.seed,
-            snr_min=getattr(args, "snr_min", None),
-        )
-        # Build a fresh context/registry for classification
-        ctx, registry = build_default_context_and_registry(
-            f_lim=args.f_lim,
-            wave_min=args.wave_min,
-            wave_max=args.wave_max,
-            volume_mode=args.volume_mode,
-            n_fibers=getattr(args, "n_fibers", None),
-            ifu_count=getattr(args, "ifu_count", None),
-            exposure_scale=getattr(args, "exposure_scale", None),
-            search_measure_scale=getattr(args, "search_measure_scale", None),
-            F50=getattr(args, "F50", None),
-            w=getattr(args, "w", None),
-            F50_table=F50_table,
-            w_table=w_table,
-        )
-        # Apply prior toggles to context config
-        try:
-            if isinstance(ctx.config, dict):
-                ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
-                ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
-        except Exception:
-            pass
-        if fake_lambda_cache is not None:
-            try:
-                ctx.caches["fake_lambda_pdf"] = fake_lambda_cache
-            except Exception:
-                pass
+    log("[jlc.simulate] Using engine-aligned simulate_field() API (new architecture source of truth)")
+    df = simulate_field_api(
+        registry=registry,
+        ctx=ctx,
+        ra_low=args.ra_low,
+        ra_high=args.ra_high,
+        dec_low=args.dec_low,
+        dec_high=args.dec_high,
+        wave_min=args.wave_min,
+        wave_max=args.wave_max,
+        flux_err=args.flux_err,
+        f_lim=args.f_lim,
+        fake_rate_per_sr_per_A=args.fake_rate,
+        seed=args.seed,
+        nz=args.nz,
+        snr_min=getattr(args, "snr_min", None),
+    )
+
 
     # Save simulated catalog
     if args.out_catalog:
@@ -637,19 +372,10 @@ def main(argv=None):
     p_sim.add_argument("--ra-dec-factor", dest="ra_dec_factor", default=None, help="Load RA/Dec modulation function as module:function; signature g(ra, dec, lam)->[0,1]")
     p_sim.add_argument("--flux-err", dest="flux_err", type=float, default=5e-18, help="Per-object flux error")
     p_sim.add_argument("--snr-min", dest="snr_min", type=float, default=None, help="Minimum S/N (flux_hat/flux_err) to include a detection in the simulated catalog")
-    p_sim.add_argument("--lae-frac", dest="lae_frac", type=float, default=0.3)
-    p_sim.add_argument("--oii-frac", dest="oii_frac", type=float, default=0.3)
-    p_sim.add_argument("--fake-frac", dest="fake_frac", type=float, default=0.4)
-    p_sim.add_argument("--from-model", dest="from_model", action="store_true", help="Use model-driven PPP simulation instead of simple fractions")
     p_sim.add_argument("--fake-rate", dest="fake_rate", type=float, default=0.0, help="Fake rate density per sr per Angstrom for PPP mode")
     p_sim.add_argument("--calibrate-fake-rate-from", dest="calibrate_fake_rate_from", default=None, help="CSV of virtual detections to estimate a homogeneous fake rate ρ; uses current sky box and wavelength band")
-    p_sim.add_argument("--validate-fake-rate-from", dest="validate_fake_rate_from", default=None, help="CSV of virtual detections to validate the provided or calibrated fake rate ρ against N̂=ρ·Ω·Δλ; logs summary and stores in ctx.config['fake_rate_validation']")
     p_sim.add_argument("--nz", dest="nz", type=int, default=256, help="Number of redshift grid points for PPP mode")
     p_sim.add_argument("--volume-mode", dest="volume_mode", choices=["real", "virtual"], default="real", help="Volume mode: real (default) or virtual (no physical sources)")
-    p_sim.add_argument("--fake-lambda-calib", dest="fake_lambda_calib", default=None, help="CSV with wave_obs from virtual detections to calibrate fake λ-PDF")
-    p_sim.add_argument("--fake-lambda-nbins", dest="fake_lambda_nbins", type=int, default=200, help="Number of bins for fake λ-PDF calibration")
-    p_sim.add_argument("--fake-lambda-cache-in", dest="fake_lambda_cache_in", default=None, help="Path to load a precomputed fake λ-PDF cache (.npz)")
-    p_sim.add_argument("--fake-lambda-cache-out", dest="fake_lambda_cache_out", default=None, help="If provided and a cache is built, save it to this path (.npz)")
     # effective_search_measure knobs
     p_sim.add_argument("--n-fibers", dest="n_fibers", type=int, default=None, help="Number of fibers contributing to search (multiplier)")
     p_sim.add_argument("--ifu-count", dest="ifu_count", type=int, default=None, help="Number of IFUs contributing (multiplier)")
@@ -674,13 +400,6 @@ def main(argv=None):
     p_sim.add_argument("--evidence-only", dest="evidence_only", action="store_true", help="Disable per-row rate priors; use evidences only for posteriors")
     p_sim.add_argument("--no-global-priors", dest="no_global_priors", action="store_true", help="Do not use global prior weights (e.g., PPP expected counts)")
     p_sim.add_argument("--ppp-debug", dest="ppp_debug", action="store_true", help="Enable verbose PPP diagnostics (volumes, z-ranges, selection summaries)")
-    # Parity check: run both backends and compare expected counts/volumes
-    p_sim.add_argument("--ppp-parity-check", dest="ppp_parity_check", action="store_true", help="Run both engine-aligned and legacy PPP simulators and compare expected counts/volumes (logs + summary)")
-    p_sim.add_argument("--parity-rtol", dest="parity_rtol", type=float, default=1e-3, help="Relative tolerance for PPP parity checks (default 1e-3)")
-    p_sim.add_argument("--parity-atol", dest="parity_atol", type=float, default=0.0, help="Absolute tolerance for PPP parity checks (default 0.0)")
-    p_sim.add_argument("--parity-report", dest="parity_report", default=None, help="If set and --ppp-parity-check is enabled, write a JSON summary report to this path")
-    # Legacy PPP flag shim: kept for one release but errors with guidance
-    p_sim.add_argument("--legacy-ppp", dest="legacy_ppp", action="store_true", help="Removed: legacy PPP simulator is no longer available; use engine-aligned simulate_field (default)")
     p_sim.set_defaults(func=cmd_simulate)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
