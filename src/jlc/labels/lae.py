@@ -1,8 +1,17 @@
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
 from .base import LabelModel
 from jlc.population.schechter import SchechterLF
 
+
+@dataclass
+class LAEHyperparams:
+    log10_Lstar: float = 42.72
+    alpha: float = -1.75
+    log10_phistar: float = -3.20
+    Lmin: float | None = None
+    Lmax: float | None = None
 
 
 class LAELabel(LabelModel):
@@ -14,11 +23,49 @@ class LAELabel(LabelModel):
     """
     label = "lae"
     rest_wave = 1215.67  # Angstrom
+    hyperparam_cls = LAEHyperparams
+    feature_names = ("wave_obs", "flux_hat", "flux_err")
 
-    def __init__(self, lf: SchechterLF, selection_model, measurement_modules):
-        self.lf = lf
-        self.selection = selection_model
-        self.measurement_modules = list(measurement_modules)
+    def __init__(self, lf: SchechterLF | None = None, selection_model=None, measurement_modules=None, *,
+                 hyperparams: LAEHyperparams | dict | None = None, cosmology=None, noise_model=None, flux_grid=None):
+        # Hyperparameters: prefer explicit container; else derive from provided LF
+        if hyperparams is None and lf is not None:
+            hyperparams = LAEHyperparams(
+                log10_Lstar=lf.log10_Lstar,
+                alpha=lf.alpha,
+                log10_phistar=lf.log10_phistar,
+                Lmin=getattr(lf, "Lmin", None),
+                Lmax=getattr(lf, "Lmax", None),
+            )
+        self.hyperparams = self._coerce_hyperparams(hyperparams)
+        # Maintain existing LF attribute for compatibility and computations
+        if lf is None:
+            self.lf = SchechterLF(
+                self.hyperparams.log10_Lstar,
+                self.hyperparams.alpha,
+                self.hyperparams.log10_phistar,
+                Lmin=self.hyperparams.Lmin,
+                Lmax=self.hyperparams.Lmax,
+            )
+        else:
+            self.lf = lf
+        # Standardized attachments
+        self.cosmology = cosmology
+        self.selection_model = selection_model
+        self.selection = selection_model  # backward-compat field used by helpers
+        self.noise_model = noise_model
+        self.flux_grid = flux_grid
+        self.measurement_modules = list(measurement_modules or [])
+
+    # Hyperparameter helpers per refactor
+    def _coerce_hyperparams(self, hp):
+        if hp is None:
+            return self.hyperparam_cls()
+        if isinstance(hp, self.hyperparam_cls):
+            return hp
+        if isinstance(hp, dict):
+            return self.hyperparam_cls(**hp)
+        return self.hyperparam_cls()
 
     def rate_density(self, row: pd.Series, ctx) -> float:
         # Use shared helper for observed-space rate density integration (per sr per Å)

@@ -17,24 +17,40 @@ class LabelModel(ABC):
     label: str
     measurement_modules: Sequence
 
-    def log_evidence(self, row: pd.Series, ctx) -> EvidenceResult:
-        """Deprecated shim: return log P(row | label) for backward compatibility.
+    # --- Hyperparameter helpers (generic defaults) ---
+    def _coerce_hyperparams(self, hp):
+        return hp  # subclass should override to enforce dataclass
 
-        Use extra_log_likelihood() and rate_density() with the thin engine instead.
-        This default shim wraps extra_log_likelihood in an EvidenceResult and
-        emits a DeprecationWarning (stacklevel=2). Subclasses may override to
-        attach metadata for legacy callers.
-        """
-        warnings.warn(
-            "LabelModel.log_evidence is deprecated; implement extra_log_likelihood() and use the engine's combined posterior",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    def get_hyperparams(self):
+        return getattr(self, "hyperparams", None)
+
+    def get_hyperparams_dict(self):
+        import dataclasses
+        hp = getattr(self, "hyperparams", None)
         try:
-            ell = float(self.extra_log_likelihood(row, ctx))
+            return dataclasses.asdict(hp) if hp is not None else {}
         except Exception:
-            ell = float("-inf")
-        return EvidenceResult(getattr(self, "label", "unknown"), ell, {})
+            return {}
+
+    def set_hyperparams(self, **updates):
+        hp_dict = self.get_hyperparams_dict()
+        hp_dict.update(updates)
+        cls = getattr(self, "hyperparam_cls", None)
+        if cls is not None:
+            try:
+                self.hyperparams = cls(**hp_dict)
+                return
+            except Exception:
+                pass
+        # fallback: store dict
+        self.hyperparams = hp_dict
+
+    def to_config(self) -> dict:
+        """Serialize minimal label configuration (hyperparameters only)."""
+        return {
+            "label": getattr(self, "label", None),
+            "hyperparams": self.get_hyperparams_dict(),
+        }
 
     def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
         """Return measurement-only log-evidence not included in rate_density.

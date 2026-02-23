@@ -97,10 +97,28 @@ def build_default_context_and_registry(f_lim: float | None = None, wave_min: flo
 
     flux_meas = FluxMeasurement()
 
-    lae = LAELabel(lae_lf, selection, [flux_meas])
-    oii = OIILabel(oii_lf, selection, [flux_meas])
+    # Initialize labels using the refactored standardized constructor
+    lae = LAELabel(
+        lf=lae_lf,
+        selection_model=selection,
+        measurement_modules=[flux_meas],
+        cosmology=cosmo,
+        flux_grid=_fg,
+    )
+    oii = OIILabel(
+        lf=oii_lf,
+        selection_model=selection,
+        measurement_modules=[flux_meas],
+        cosmology=cosmo,
+        flux_grid=_fg,
+    )
     # Tie Fake label to selection and measurement, consistent with simulator
-    fake = FakeLabel(selection_model=selection, measurement_modules=[flux_meas])
+    fake = FakeLabel(
+        selection_model=selection,
+        measurement_modules=[flux_meas],
+        cosmology=cosmo,
+        flux_grid=_fg,
+    )
 
     registry = LabelRegistry([lae, oii, fake])
     return ctx, registry

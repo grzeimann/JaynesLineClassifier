@@ -1,25 +1,39 @@
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
 from .base import LabelModel
 from jlc.types import EvidenceResult
 from jlc.utils.constants import EPS_LOG
 
 
-class FakeLabel(LabelModel):
-    """Fake label model: contextual rate prior + flux-marginalized evidence.
+@dataclass
+class FakeHyperparams:
+    # Use linear rate density to align with current config; allow None to defer to ctx.config
+    rate_per_sr_per_A: float | None = None
+    mu_ln_offset: float = -2.0
+    sigma_ln: float = 1.0
 
-    - rate_density(row, ctx): base fake rate per sr per Å, optionally a simple
-      mixture over components (e.g., sky_residual, noise) and modulated by an
-      empirical λ-PDF if available; multiplied by effective_search_measure.
-    - extra_log_likelihood(row, ctx): measurement-only evidence marginalized
-      over latent flux using the shared FluxGrid with a neutral prior on F.
-    - simulate_catalog(...): per-label simulator consistent with the same
-      ingredients used in rate_density; yields diagnostics like μ and band size.
+
+class FakeLabel(LabelModel):
+    """Fake label model: homogeneous λ-rate with flux-conditioned prior.
+
+    - rate_density(row, ctx): r_fake(λ, F_hat) = ρ(λ) · ∫ dF p_fake(F) S(F,λ) p(F_hat|F)
+      where ρ(λ) is a base per-(sr·Å) rate optionally modulated by an empirical λ-PDF,
+      p_fake(F) is a LogNormal prior over true flux, S is selection completeness, and
+      p(F_hat|F) is the Gaussian flux measurement model from flux_err. Multiplies by
+      effective_search_measure(row, ctx).
+    - extra_log_likelihood(row, ctx): measurement-only evidence marginalized over
+      latent flux using the shared FluxGrid with a neutral prior on F.
+    - simulate_catalog(...): per-label simulator consistent with the same ingredients
+      used in rate_density; yields diagnostics like μ and band size.
     """
     label = "fake"
+    rest_wave = None
+    hyperparam_cls = FakeHyperparams
+    feature_names = ("wave_obs", "flux_hat", "flux_err")
 
-    def __init__(self, selection_model=None, measurement_modules=None, mu_ln_offset: float = -2.0, sigma_ln: float = 1.0,
-                 use_mixture: bool = True):
+    def __init__(self, selection_model=None, measurement_modules=None, mu_ln_offset: float = -2.0, sigma_ln: float = 1.0, *,
+                 hyperparams: FakeHyperparams | dict | None = None, cosmology=None, noise_model=None, flux_grid=None):
         """
         A generative Fake label consistent with the simulator assumptions.
 
@@ -31,20 +45,39 @@ class FakeLabel(LabelModel):
         - Selection S(F, λ) is applied using the provided selection_model; if None, S=1.
         - Measurement likelihoods are applied via measurement_modules (e.g., FluxMeasurement).
         - Marginalization over F_true is performed on the shared FluxGrid cache.
-
-        Phase 2 extension:
-        - Optional contextual mixture for fake rate prior. If use_mixture=True (default),
-          rate_density() computes a mixture over simple components and exposes per-component
-          rates via rate_components(). Backward compatible: if disabled or features absent,
-          behavior reduces to a uniform rate modulated by empirical λ-PDF when available.
         """
-        self.selection = selection_model
+        # Build hyperparams: prefer explicit container, else from provided offsets
+        if hyperparams is None:
+            hyperparams = FakeHyperparams(rate_per_sr_per_A=None, mu_ln_offset=float(mu_ln_offset), sigma_ln=float(sigma_ln))
+        self.hyperparams = self._coerce_hyperparams(hyperparams)
+        # Back-compat attribute aliases used throughout methods
+        try:
+            self.mu_ln_offset = float(self.hyperparams.mu_ln_offset)
+        except Exception:
+            self.mu_ln_offset = -2.0
+        try:
+            self.sigma_ln = float(self.hyperparams.sigma_ln)
+        except Exception:
+            self.sigma_ln = 1.0
+        # Standardized attachments
+        self.cosmology = cosmology
+        self.selection_model = selection_model
+        self.selection = selection_model  # backward compat
+        self.noise_model = noise_model
+        self.flux_grid = flux_grid
         self.measurement_modules = list(measurement_modules or [])
-        self.mu_ln_offset = float(mu_ln_offset)
-        self.sigma_ln = float(sigma_ln)
-        self.use_mixture = bool(use_mixture)
 
-    # --- Mixture helpers (Phase 2) ---
+    # Hyperparameter helpers
+    def _coerce_hyperparams(self, hp):
+        if hp is None:
+            return self.hyperparam_cls()
+        if isinstance(hp, self.hyperparam_cls):
+            return hp
+        if isinstance(hp, dict):
+            return self.hyperparam_cls(**hp)
+        return self.hyperparam_cls()
+
+    # --- Rate helpers ---
     def _base_rho(self, ctx) -> float:
         try:
             cfg = getattr(ctx, "config", {}) or {}
@@ -65,61 +98,109 @@ class FakeLabel(LabelModel):
         except Exception:
             return 1.0
 
-    def _mixture_weights(self, row: pd.Series, ctx) -> dict[str, float]:
-        """
-        Return mixture weights π_k(x) that sum to 1.0. Uses contextual features if present.
-        Defaults to uniform weights over two components: sky_residual and noise.
-        """
-        # Placeholder contextual hooks (future): sky_line_prox, dist_to_mask, ifu_flags, n_exp_support
-        # For now, use uniform weights.
-        return {"sky_residual": 0.5, "noise": 0.5}
+    def rate_density(self, row: pd.Series, ctx) -> float:
+        """Flux-conditioned fake rate per sr per Å.
 
-    def rate_components(self, row: pd.Series, ctx) -> dict[str, float]:
-        """Per-component fake rates (per sr per Å) for diagnostics. Safe and finite."""
-        lam = float(row.get("wave_obs", np.nan))
+        r_fake(λ, F_hat) = ρ(λ) · ∫ dF_true p_fake(F_true) · S(F_true,λ) · p(F_hat|F_true)
+        where p_fake is the lognormal prior configured by (mu_ln_offset, sigma_ln),
+        S is selection completeness, and p(F_hat|F_true) is Gaussian with sigma=flux_err.
+        Multiplies by effective_search_measure(row, ctx).
+        """
+        # Base λ-shape
+        try:
+            lam = float(row.get("wave_obs", np.nan))
+        except Exception:
+            lam = float("nan")
+        if not (np.isfinite(lam) and lam > 0):
+            return 0.0
         rho = self._base_rho(ctx)
-        # component shapes s_k(row)
-        s_sky = self._lambda_shape(lam, ctx)  # modulated by empirical λ-PDF
-        s_noise = 1.0  # constant baseline
-        shapes = {"sky_residual": s_sky, "noise": s_noise}
-        pis = self._mixture_weights(row, ctx)
-        # Effective search measure multiplier
-        eff = 1.0
+        if rho <= 0 or not np.isfinite(rho):
+            return 0.0
+        rho_lambda = rho * self._lambda_shape(lam, ctx)
+        # Measurement
+        try:
+            F_hat = float(row.get("flux_hat", np.nan))
+            sigma = float(row.get("flux_err", np.nan))
+        except Exception:
+            F_hat, sigma = float("nan"), float("nan")
+        if not (np.isfinite(F_hat) and F_hat >= 0):
+            return 0.0
+        # Flux prior parameters
+        try:
+            f_lim = getattr(ctx, "config", {}).get("f_lim", None)
+            base = max(float(f_lim) if f_lim is not None else 1e-17, 1e-20)
+        except Exception:
+            base = 1e-17
+        mu_ln = np.log(base) + self.mu_ln_offset
+        sigma_ln = self.sigma_ln
+        # Build F_true grid from shared FluxGrid; fallback to local window around F_hat
+        F_grid_true = None
+        try:
+            fg = getattr(getattr(ctx, "caches", {}), "get", lambda k, d=None: None)("flux_grid")
+            if fg is not None and hasattr(fg, "grid"):
+                Fg, _w = fg.grid(row)
+                Fg = np.asarray(Fg, dtype=float)
+                Fg = Fg[np.isfinite(Fg) & (Fg >= 0.0)]
+                if Fg.size >= 2:
+                    F_grid_true = Fg
+        except Exception:
+            F_grid_true = None
+        if F_grid_true is None:
+            # local window
+            nsig = getattr(getattr(ctx, "config", {}), "get", lambda k, d=None: None)("flux_marg_nsigma")
+            try:
+                nsig = float(nsig if nsig is not None else 6.0)
+            except Exception:
+                nsig = 6.0
+            nsig = 6.0 if (not np.isfinite(nsig) or nsig <= 0) else nsig
+            F_min = max(0.0, F_hat - nsig * max(sigma, 0.0 if not np.isfinite(sigma) else sigma))
+            F_max = F_hat + nsig * (sigma if np.isfinite(sigma) else 0.0)
+            span = F_max - F_min
+            if not (np.isfinite(span) and span > 0):
+                F_min = max(0.0, F_hat)
+                F_max = F_min + max(sigma if np.isfinite(sigma) else 1e-30, 1e-30)
+            Nf = getattr(getattr(ctx, "config", {}), "get", lambda k, d=None: None)("flux_marg_npts")
+            try:
+                Nf = int(Nf if Nf is not None else 256)
+            except Exception:
+                Nf = 256
+            Nf = max(int(Nf), 32)
+            F_grid_true = np.linspace(F_min, F_max, Nf, dtype=float)
+        # Selection completeness
+        sel = self.selection
+        try:
+            S = sel.completeness(F_grid_true, float(lam)) if sel is not None else np.ones_like(F_grid_true)
+            S = np.clip(np.asarray(S, dtype=float), 0.0, 1.0)
+        except Exception:
+            S = np.ones_like(F_grid_true)
+        # Prior over F_true (lognormal pdf in linear F)
+        F_safe = np.clip(F_grid_true, EPS_LOG, None)
+        log_pF = -0.5 * ((np.log(F_safe) - mu_ln) / sigma_ln) ** 2 - np.log(F_safe * sigma_ln * np.sqrt(2 * np.pi))
+        pF = np.exp(log_pF)
+        # Measurement model p(F_hat | F_true)
+        if np.isfinite(sigma) and sigma > 0:
+            inv_s = 1.0 / sigma
+            norm = inv_s / np.sqrt(2.0 * np.pi)
+            resid = (F_hat - F_grid_true) * inv_s
+            p_meas = norm * np.exp(-0.5 * resid * resid)
+        else:
+            # delta-like: evaluate at F_hat by nearest grid bin
+            idx = int(np.argmin(np.abs(F_grid_true - F_hat)))
+            p_meas = np.zeros_like(F_grid_true)
+            p_meas[idx] = 1.0 / max(np.gradient(F_grid_true)[idx], 1e-30)  # approximate delta density
+        # Integrate
+        integrand = pF * S * p_meas
+        factor = float(np.trapz(integrand, x=F_grid_true))
+        if not np.isfinite(factor) or factor < 0:
+            factor = 0.0
+        r = rho_lambda * factor
+        # Effective search measure
         try:
             from jlc.rates.observed_space import effective_search_measure
-            eff = float(effective_search_measure(row, ctx))
+            r *= float(effective_search_measure(row, ctx))
         except Exception:
             pass
-        # Combine into per-component intensities: r_k = rho * π_k * s_k * eff
-        out = {}
-        for k, pi in pis.items():
-            sk = float(shapes.get(k, 1.0))
-            val = max(rho * max(float(pi), 0.0) * max(sk, 0.0) * max(eff, 0.0), 0.0)
-            out[k] = float(val if np.isfinite(val) else 0.0)
-        return out
-
-    def rate_density(self, row: pd.Series, ctx) -> float:
-        """Contextual mixture fake rate per sr per Å.
-
-        - Base rate from ctx.config["fake_rate_per_sr_per_A"].
-        - Optionally modulated by empirical λ-PDF shape via a sky_residual component.
-        - Multiplies by effective_search_measure.
-        - Backward compatible: if use_mixture=False, reduces to legacy single-component behavior.
-        """
-        if not self.use_mixture:
-            # Legacy single-component
-            lam = float(row.get("wave_obs", np.nan))
-            r = self._base_rho(ctx)
-            r *= self._lambda_shape(lam, ctx)
-            try:
-                from jlc.rates.observed_space import effective_search_measure
-                r *= float(effective_search_measure(row, ctx))
-            except Exception:
-                pass
-            return r
-        # Mixture path
-        comps = self.rate_components(row, ctx)
-        return float(sum(comps.values()))
+        return float(max(r, 0.0))
 
     def _flux_logprior(self, F: np.ndarray, f_lim: float | None) -> np.ndarray:
         # LogNormal prior density over F (in linear flux units)
