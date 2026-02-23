@@ -21,3 +21,12 @@ hyperparams:
         type: "deterministic-from-z"
         params:
           rest_wave: 1215.67
+
+  selection:
+    default_sigma: 5.0e-18
+    sn:
+      model: "logistic_per_lambda_bin"
+      params:
+        bins_wave: [3600, 4500, 5400]
+        sn50: [5.8, 6.0, 5.9]
+        width: [0.9, 0.9, 1.0]
