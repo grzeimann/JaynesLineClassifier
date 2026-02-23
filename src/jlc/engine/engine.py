@@ -8,6 +8,76 @@ class JaynesianEngine:
         self.registry = registry
         self.ctx = ctx
 
+    def apply_prior_record(self, record) -> None:
+        """Apply a PriorRecord to labels and their measurement modules.
+
+        This is a thin, engine-local helper mirroring the CLI's prior-apply logic,
+        kept here to make it easily usable from tests and programmatic APIs without
+        importing the CLI layer. Shallow-merges population hyperparams into each
+        matching label and updates measurement modules' noise/prior hyperparams.
+        """
+        try:
+            hp = getattr(record, "hyperparams", {}) or {}
+        except Exception:
+            hp = {}
+        pop_hp = dict(hp.get("population", {})) if isinstance(hp.get("population", {}), dict) else {}
+        flat_hp = dict(hp) if isinstance(hp, dict) else {}
+        flat_hp.pop("population", None)
+        meas_hp = dict(hp.get("measurements", {})) if isinstance(hp.get("measurements", {}), dict) else {}
+        for L in self.registry.labels:
+            m = self.registry.model(L)
+            try:
+                rec_label = getattr(record, "label", None)
+            except Exception:
+                rec_label = None
+            if rec_label not in (None, "all", L):
+                continue
+            # Merge population hyperparameters
+            to_set = {}
+            to_set.update(pop_hp)
+            to_set.update(flat_hp)
+            if len(to_set) > 0 and hasattr(m, "set_hyperparams"):
+                try:
+                    m.set_hyperparams(**to_set)
+                except Exception:
+                    pass
+            # Update measurement modules
+            try:
+                for mod in getattr(m, "measurement_modules", []) or []:
+                    name = getattr(mod, "name", None)
+                    if not name:
+                        continue
+                    blk = meas_hp.get(name, {}) or {}
+                    try:
+                        nz = blk.get("noise", {}) or {}
+                        nz_params = dict(nz.get("params", {})) if isinstance(nz.get("params", {}), dict) else dict(nz)
+                    except Exception:
+                        nz_params = {}
+                    try:
+                        pr = blk.get("prior", {}) or {}
+                        pr_params = dict(pr.get("params", {})) if isinstance(pr.get("params", {}), dict) else dict(pr)
+                    except Exception:
+                        pr_params = {}
+                    if len(nz_params) > 0:
+                        try:
+                            mod.noise_hyperparams.update(nz_params)
+                        except Exception:
+                            mod.noise_hyperparams = dict(nz_params)
+                    if len(pr_params) > 0:
+                        try:
+                            mod.prior_hyperparams.update(pr_params)
+                        except Exception:
+                            mod.prior_hyperparams = dict(pr_params)
+            except Exception:
+                pass
+        # record provenance on context when possible
+        try:
+            if isinstance(getattr(self, "ctx", None), object) and isinstance(getattr(self.ctx, "config", {}), dict):
+                self.ctx.config["loaded_prior_name"] = getattr(record, "name", None)
+                self.ctx.config["loaded_prior_label"] = getattr(record, "label", None)
+        except Exception:
+            pass
+
     @classmethod
     def from_config(cls, cfg: dict, ctx):
         """

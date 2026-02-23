@@ -1,0 +1,18 @@
+name: "fake_default_example"
+scope: "label"
+label: "fake"
+source: "examples"
+notes: "Example PriorRecord for Fake label; homogeneous rate with simple flux prior."
+
+hyperparams:
+  population:
+    rate_per_sr_per_A: null  # prefer ctx.config.fake_rate_per_sr_per_A or --fake-rate when running
+    mu_ln_offset: -2.0
+    sigma_ln: 1.0
+
+  measurements:
+    flux:
+      noise:
+        type: "gaussian"
+        params:
+          extra_scatter: 0.0

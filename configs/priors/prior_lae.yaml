@@ -1,0 +1,23 @@
+name: "lae_default_example"
+scope: "label"
+label: "lae"
+source: "examples"
+notes: "Example PriorRecord for LAE label; safe defaults near literature values."
+
+hyperparams:
+  population:
+    log10_Lstar: 42.72
+    alpha: -1.75
+    log10_phistar: -3.20
+
+  measurements:
+    flux:
+      noise:
+        type: "gaussian"
+        params:
+          extra_scatter: 0.0
+    wavelength:
+      prior:
+        type: "deterministic-from-z"
+        params:
+          rest_wave: 1215.67

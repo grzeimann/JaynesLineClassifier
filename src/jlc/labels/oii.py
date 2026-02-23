@@ -66,7 +66,24 @@ class OIILabel(LabelModel):
     def rate_density(self, row: pd.Series, ctx) -> float:
         # Use shared helper for observed-space rate density integration (per sr per Å)
         from jlc.core.population_helpers import rate_density_local
-        return float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection))
+        r = float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection))
+        # Optional factorized selection multiplier (neutral by default)
+        try:
+            use_fac = bool(getattr(ctx, "config", {}).get("use_factorized_selection", False))
+        except Exception:
+            use_fac = False
+        if use_fac and self.selection is not None:
+            try:
+                wave_obs = float(row.get("wave_obs", np.nan))
+                F_hat = float(row.get("flux_hat", np.nan))
+                latent = {"F_true": float(F_hat) if np.isfinite(F_hat) else 0.0,
+                          "wave_true": float(wave_obs) if np.isfinite(wave_obs) else float(self.rest_wave)}
+                c_fac = float(self.selection.completeness_factorized(self, latent, self.measurement_modules, ctx))
+                if np.isfinite(c_fac) and c_fac >= 0:
+                    r *= c_fac
+            except Exception:
+                pass
+        return r
 
     def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
         """Measurement-only evidence marginalized over F with neutral prior."""
@@ -76,7 +93,8 @@ class OIILabel(LabelModel):
         F_grid, log_w = ctx.caches["flux_grid"].grid(row)
         log_like = np.zeros_like(F_grid)
         for k, F in enumerate(F_grid):
-            latent = {"F_true": float(F), "z": float(z)}
+            wave_true = self.rest_wave * (1.0 + float(z))
+            latent = {"F_true": float(F), "z": float(z), "wave_true": float(wave_true)}
             ll = 0.0
             for m in self.measurement_modules:
                 ll += float(m.log_likelihood(row, latent, ctx))

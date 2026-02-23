@@ -1,0 +1,23 @@
+name: "oii_default_example"
+scope: "label"
+label: "oii"
+source: "examples"
+notes: "Example PriorRecord for OII label; conservative defaults."
+
+hyperparams:
+  population:
+    log10_Lstar: 41.4
+    alpha: -1.2
+    log10_phistar: -2.4
+
+  measurements:
+    flux:
+      noise:
+        type: "gaussian"
+        params:
+          extra_scatter: 0.0
+    wavelength:
+      prior:
+        type: "deterministic-from-z"
+        params:
+          rest_wave: 3727.0

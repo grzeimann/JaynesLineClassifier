@@ -200,6 +200,22 @@ class FakeLabel(LabelModel):
             r *= float(effective_search_measure(row, ctx))
         except Exception:
             pass
+        # Optional factorized selection multiplier (neutral by default)
+        try:
+            use_fac = bool(getattr(ctx, "config", {}).get("use_factorized_selection", False))
+        except Exception:
+            use_fac = False
+        if use_fac and self.selection is not None:
+            try:
+                wave_obs = float(row.get("wave_obs", np.nan))
+                F_hat = float(row.get("flux_hat", np.nan))
+                latent_fac = {"F_true": float(F_hat) if np.isfinite(F_hat) else 0.0,
+                              "wave_true": float(wave_obs) if np.isfinite(wave_obs) else float(wave_obs)}
+                c_fac = float(self.selection.completeness_factorized(self, latent_fac, self.measurement_modules, ctx))
+                if np.isfinite(c_fac) and c_fac >= 0:
+                    r *= c_fac
+            except Exception:
+                pass
         return float(max(r, 0.0))
 
     def _flux_logprior(self, F: np.ndarray, f_lim: float | None) -> np.ndarray:
@@ -217,7 +233,12 @@ class FakeLabel(LabelModel):
         F_grid, log_w = ctx.caches["flux_grid"].grid(row)
         log_like = np.zeros_like(F_grid)
         for k, F in enumerate(F_grid):
-            latent = {"F_true": float(F)}
+            # Provide deterministic wavelength latent so wavelength measurement can contribute
+            try:
+                wave_obs = float(row.get("wave_obs", np.nan))
+            except Exception:
+                wave_obs = float("nan")
+            latent = {"F_true": float(F), "wave_true": float(wave_obs)}
             ll = 0.0
             for m in self.measurement_modules:
                 ll += float(m.log_likelihood(row, latent, ctx))

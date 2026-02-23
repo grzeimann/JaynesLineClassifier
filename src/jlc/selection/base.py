@@ -8,6 +8,10 @@ class SelectionModel:
     - Hard threshold via f_lim or smooth tanh via F50, w.
     - Optional wavelength-binned tables F50(λ), w(λ) overriding scalars within table domain.
     - Optional RA/Dec modulation factor g(ra, dec, λ) ∈ [0,1] applied multiplicatively.
+
+    Extended API per measurements-priors spec:
+    - completeness_factorized(label, latent, measurements, ctx): combine per-measurement
+      completeness factors without breaking existing callers.
     """
     def __init__(
         self,
@@ -247,3 +251,35 @@ class SelectionModel:
                 # ignore RA/Dec factor errors to preserve robustness
                 pass
         return np.clip(C, 0.0, 1.0)
+
+    # ---------------- Factorized completeness over measurements ----------------
+    def completeness_factorized(self, label, latent: Dict[str, Any], measurements, ctx) -> float:
+        """Combine per-measurement completeness factors multiplicatively.
+
+        This non-breaking API allows selection effects that depend on multiple
+        measurements (or their latents) without requiring a joint grid.
+        Defaults to 1.0 for each measurement unless overridden by subclasses.
+        """
+        try:
+            c = 1.0
+            for m in (measurements or []):
+                c *= float(self._completeness_for_measurement(label, m, latent, ctx))
+            if not np.isfinite(c) or c < 0:
+                return 0.0
+            return float(np.clip(c, 0.0, 1.0))
+        except Exception:
+            return 1.0
+
+    def _completeness_for_measurement(self, label, measurement, latent: Dict[str, Any], ctx) -> float:
+        """Per-measurement hook. Default returns 1.0 (no effect).
+
+        Subclasses may override to implement dependencies like S/N cuts that
+        involve a measurement's observed or latent value.
+        """
+        try:
+            # Example: if measurement provides a latent_key and a value is present, we could
+            # implement simple thresholds based on prior hyperparams in ctx.config or elsewhere.
+            # For now, neutral factor.
+            return 1.0
+        except Exception:
+            return 1.0

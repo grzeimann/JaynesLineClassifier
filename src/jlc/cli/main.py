@@ -15,10 +15,12 @@ from jlc.population.schechter import SchechterLF
 from jlc.cosmology.lookup import AstropyCosmology
 from jlc.selection.base import SelectionModel
 from jlc.measurements.flux import FluxMeasurement
+from jlc.measurements.wavelength import WavelengthMeasurement
 from jlc.simulate.simple import SkyBox, plot_distributions, plot_selection_completeness
 from jlc.simulate.field import simulate_field as simulate_field_api
 from jlc.utils.logging import log
 from jlc.utils.cli_helpers import load_ra_dec_factor, load_completeness_tables
+from jlc.priors import PriorRecord, load_prior_record, save_prior_record, apply_prior_to_label
 
 # Named defaults to avoid magic numbers sprinkled around
 FLUXGRID_DEFAULT_MIN = 1e-18
@@ -96,32 +98,106 @@ def build_default_context_and_registry(f_lim: float | None = None, wave_min: flo
                          Lmin=1e-3 * oii_Lstar, Lmax=1e+3 * oii_Lstar)  # Ciardullo et al.
 
     flux_meas = FluxMeasurement()
+    wave_meas = WavelengthMeasurement()
+
+    measurements = [flux_meas, wave_meas]
 
     # Initialize labels using the refactored standardized constructor
     lae = LAELabel(
         lf=lae_lf,
         selection_model=selection,
-        measurement_modules=[flux_meas],
+        measurement_modules=measurements,
         cosmology=cosmo,
         flux_grid=_fg,
     )
     oii = OIILabel(
         lf=oii_lf,
         selection_model=selection,
-        measurement_modules=[flux_meas],
+        measurement_modules=measurements,
         cosmology=cosmo,
         flux_grid=_fg,
     )
     # Tie Fake label to selection and measurement, consistent with simulator
     fake = FakeLabel(
         selection_model=selection,
-        measurement_modules=[flux_meas],
+        measurement_modules=measurements,
         cosmology=cosmo,
         flux_grid=_fg,
     )
 
     registry = LabelRegistry([lae, oii, fake])
     return ctx, registry
+
+
+def _apply_prior_record_to_runtime(record: PriorRecord, registry, ctx) -> None:
+    """Apply a PriorRecord to labels and measurement modules in-place.
+
+    - population: shallow-merge into label hyperparams (accepts either flat keys
+      matching dataclass fields, or under a 'population' block).
+    - measurements: if present, set noise/prior hyperparams for matching modules
+      by name (e.g., 'flux', 'wavelength').
+    """
+    try:
+        hp = record.hyperparams or {}
+    except Exception:
+        hp = {}
+    pop_hp = dict(hp.get("population", {})) if isinstance(hp.get("population", {}), dict) else {}
+    flat_hp = dict(hp) if isinstance(hp, dict) else {}
+    # avoid duplicating nested keys when shallow-merging later
+    flat_hp.pop("population", None)
+    meas_hp = dict(hp.get("measurements", {})) if isinstance(hp.get("measurements", {}), dict) else {}
+    # Apply to each label model that matches
+    for L in registry.labels:
+        m = registry.model(L)
+        # label filter
+        if record.label not in (None, "all", L):
+            continue
+        # population hyperparams (prefer nested block, then flat fallback)
+        to_set = {}
+        to_set.update(pop_hp)
+        to_set.update(flat_hp)
+        if len(to_set) > 0 and hasattr(m, "set_hyperparams"):
+            try:
+                m.set_hyperparams(**to_set)
+            except Exception:
+                pass
+        # measurement blocks
+        try:
+            for mod in getattr(m, "measurement_modules", []) or []:
+                name = getattr(mod, "name", None)
+                if name is None:
+                    continue
+                blk = meas_hp.get(name, {}) or {}
+                # noise/prior params might be nested under types; we expect params at blk["noise"]["params"], blk["prior"]["params"]
+                try:
+                    nz = blk.get("noise", {}) or {}
+                    nz_params = dict(nz.get("params", {})) if isinstance(nz.get("params", {}), dict) else dict(nz)
+                except Exception:
+                    nz_params = {}
+                try:
+                    pr = blk.get("prior", {}) or {}
+                    pr_params = dict(pr.get("params", {})) if isinstance(pr.get("params", {}), dict) else dict(pr)
+                except Exception:
+                    pr_params = {}
+                if len(nz_params) > 0:
+                    try:
+                        mod.noise_hyperparams.update(nz_params)
+                    except Exception:
+                        mod.noise_hyperparams = dict(nz_params)
+                if len(pr_params) > 0:
+                    try:
+                        mod.prior_hyperparams.update(pr_params)
+                    except Exception:
+                        mod.prior_hyperparams = dict(pr_params)
+        except Exception:
+            pass
+    # record path for provenance if available
+    try:
+        if isinstance(ctx.config, dict):
+            ctx.config["loaded_prior_name"] = record.name
+            ctx.config["loaded_prior_label"] = record.label
+    except Exception:
+        pass
 
 
 def cmd_classify(args) -> int:
@@ -132,11 +208,36 @@ def cmd_classify(args) -> int:
     ctx, registry = build_default_context_and_registry(F50=getattr(args, "F50", None), w=getattr(args, "w", None), F50_table=F50_table, w_table=w_table,
                                          fluxgrid_min=getattr(args, "fluxgrid_min", None), fluxgrid_max=getattr(args, "fluxgrid_max", None), fluxgrid_n=getattr(args, "fluxgrid_n", None),
                                          ra_dec_factor=ra_dec_fn)
+    # Optionally load and apply a PriorRecord
+    if getattr(args, "load_prior", None):
+        # Accept either a single YAML path or a directory containing multiple prior YAMLs
+        lp = args.load_prior
+        try:
+            import os
+            paths = []
+            if os.path.isdir(lp):
+                for fn in os.listdir(lp):
+                    if fn.lower().endswith((".yaml", ".yml")):
+                        paths.append(os.path.join(lp, fn))
+            else:
+                paths = [lp]
+            if len(paths) == 0:
+                log(f"[jlc.classify] Warning: no prior YAMLs found in directory {lp}")
+            for pth in paths:
+                try:
+                    rec = load_prior_record(pth)
+                    _apply_prior_record_to_runtime(rec, registry, ctx)
+                    log(f"[jlc.classify] Loaded prior record '{rec.name}' (scope={rec.scope}, label={rec.label}) from {pth}")
+                except Exception as e:
+                    log(f"[jlc.classify] Warning: failed to load/apply prior '{pth}': {e}")
+        except Exception as e:
+            log(f"[jlc.classify] Warning: failed to process --load-prior '{lp}': {e}")
     # Apply prior toggles to context config
     try:
         if isinstance(ctx.config, dict):
             ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
             ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
+            ctx.config["use_factorized_selection"] = bool(getattr(args, "use_factorized_selection", False))
             if getattr(args, "engine_mode", None) is not None:
                 ctx.config["engine_mode"] = str(args.engine_mode)
     except Exception:
@@ -145,6 +246,36 @@ def cmd_classify(args) -> int:
     out = engine.compute_extra_log_likelihood_matrix(df)
     out = engine.normalize_posteriors(out)
     out.to_csv(args.out, index=False)
+    # Optionally save per-label PriorRecord snapshots
+    if getattr(args, "save_prior_dir", None):
+        import os
+        save_dir = args.save_prior_dir
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception:
+            pass
+        for L in registry.labels:
+            try:
+                m = registry.model(L)
+                # Build hyperparams structure: population + measurements
+                pop = m.get_hyperparams_dict() if hasattr(m, "get_hyperparams_dict") else {}
+                meas = {}
+                for mod in getattr(m, "measurement_modules", []) or []:
+                    nm = getattr(mod, "name", None)
+                    if nm is None:
+                        continue
+                    meas[nm] = {
+                        "noise": {"type": "gaussian", "params": dict(getattr(mod, "noise_hyperparams", {}) or {})},
+                        "prior": {"params": dict(getattr(mod, "prior_hyperparams", {}) or {})},
+                    }
+                rec = PriorRecord(name=f"{L}_snapshot", scope="label", label=L,
+                                  hyperparams={"population": pop, "measurements": meas},
+                                  source="cli_snapshot", notes="Saved after classification run")
+                path = os.path.join(save_dir, f"prior_{L}.yaml")
+                save_prior_record(rec, path)
+                log(f"[jlc.classify] Saved PriorRecord snapshot for {L} to {path}")
+            except Exception as e:
+                log(f"[jlc.classify] Warning: failed to save PriorRecord for {L}: {e}")
     return 0
 
 
@@ -195,12 +326,41 @@ def cmd_simulate(args) -> int:
         ra_dec_factor=ra_dec_fn,
     )
 
+    # Optionally load and apply a PriorRecord
+    if getattr(args, "load_prior", None):
+        # Accept either a single YAML path or a directory containing multiple prior YAMLs
+        lp = args.load_prior
+        try:
+            import os
+            paths = []
+            if os.path.isdir(lp):
+                for fn in os.listdir(lp):
+                    if fn.lower().endswith((".yaml", ".yml")):
+                        paths.append(os.path.join(lp, fn))
+            else:
+                paths = [lp]
+            if len(paths) == 0:
+                log(f"[jlc.simulate] Warning: no prior YAMLs found in directory {lp}")
+            for pth in paths:
+                try:
+                    rec = load_prior_record(pth)
+                    _apply_prior_record_to_runtime(rec, registry, ctx)
+                    log(f"[jlc.simulate] Loaded prior record '{rec.name}' (scope={rec.scope}, label={rec.label}) from {pth}")
+                except Exception as e:
+                    log(f"[jlc.simulate] Warning: failed to load/apply prior '{pth}': {e}")
+        except Exception as e:
+            log(f"[jlc.simulate] Warning: failed to process --load-prior '{lp}': {e}")
     # Apply prior toggles and debug flag to context config
     try:
         if isinstance(ctx.config, dict):
             ctx.config["use_rate_priors"] = not bool(getattr(args, "evidence_only", False))
             ctx.config["use_global_priors"] = not bool(getattr(args, "no_global_priors", False))
             ctx.config["ppp_debug"] = bool(getattr(args, "ppp_debug", False))
+            # Propagate measurement simulation knobs
+            if getattr(args, "wave_err", None) is not None:
+                ctx.config["wave_err_sim"] = float(args.wave_err)
+            if getattr(args, "flux_err", None) is not None:
+                ctx.config["flux_err_sim"] = float(args.flux_err)
     except Exception:
         pass
 
@@ -346,6 +506,35 @@ def cmd_simulate(args) -> int:
             plot_selection_completeness(ctx.selection, args.plot_prefix)
         except Exception as e:
             log(f"[jlc.simulate] Warning: failed to plot selection completeness: {e}")
+    # Optionally save per-label PriorRecord snapshots
+    if getattr(args, "save_prior_dir", None):
+        import os
+        save_dir = args.save_prior_dir
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except Exception:
+            pass
+        for L in registry.labels:
+            try:
+                m = registry.model(L)
+                pop = m.get_hyperparams_dict() if hasattr(m, "get_hyperparams_dict") else {}
+                meas = {}
+                for mod in getattr(m, "measurement_modules", []) or []:
+                    nm = getattr(mod, "name", None)
+                    if nm is None:
+                        continue
+                    meas[nm] = {
+                        "noise": {"type": "gaussian", "params": dict(getattr(mod, "noise_hyperparams", {}) or {})},
+                        "prior": {"params": dict(getattr(mod, "prior_hyperparams", {}) or {})},
+                    }
+                rec = PriorRecord(name=f"{L}_snapshot", scope="label", label=L,
+                                  hyperparams={"population": pop, "measurements": meas},
+                                  source="cli_snapshot", notes="Saved after simulate/classify run")
+                path = os.path.join(save_dir, f"prior_{L}.yaml")
+                save_prior_record(rec, path)
+                log(f"[jlc.simulate] Saved PriorRecord snapshot for {L} to {path}")
+            except Exception as e:
+                log(f"[jlc.simulate] Warning: failed to save PriorRecord for {L}: {e}")
     return 0
 
 
@@ -370,6 +559,10 @@ def main(argv=None):
     p_classify.add_argument("--fluxgrid-min", dest="fluxgrid_min", type=float, default=None, help="Minimum flux for FluxGrid (default 1e-18 if unset)")
     p_classify.add_argument("--fluxgrid-max", dest="fluxgrid_max", type=float, default=None, help="Maximum flux for FluxGrid (default 1e-14 if unset)")
     p_classify.add_argument("--fluxgrid-n", dest="fluxgrid_n", type=int, default=None, help="Number of flux grid points (default 128 if unset)")
+    p_classify.add_argument("--load-prior", dest="load_prior", default=None, help="Path to a PriorRecord YAML to apply before classification")
+    p_classify.add_argument("--save-prior-dir", dest="save_prior_dir", default=None, help="Directory to save per-label PriorRecord snapshots after classification")
+    # Factorized selection toggle
+    p_classify.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors")
     p_classify.set_defaults(func=cmd_classify)
 
     p_sim = sub.add_parser("simulate", help="Generate a mock catalog and classify")
@@ -389,6 +582,7 @@ def main(argv=None):
     # RA/Dec-dependent selection modulation
     p_sim.add_argument("--ra-dec-factor", dest="ra_dec_factor", default=None, help="Load RA/Dec modulation function as module:function; signature g(ra, dec, lam)->[0,1]")
     p_sim.add_argument("--flux-err", dest="flux_err", type=float, default=5e-18, help="Per-object flux error")
+    p_sim.add_argument("--wave-err", dest="wave_err", type=float, default=0.0, help="Per-object wavelength error (Å) for measurement modules and simulation hooks")
     p_sim.add_argument("--snr-min", dest="snr_min", type=float, default=None, help="Minimum S/N (flux_hat/flux_err) to include a detection in the simulated catalog")
     p_sim.add_argument("--fake-rate", dest="fake_rate", type=float, default=0.0, help="Fake rate density per sr per Angstrom for PPP mode")
     p_sim.add_argument("--calibrate-fake-rate-from", dest="calibrate_fake_rate_from", default=None, help="CSV of virtual detections to estimate a homogeneous fake rate ρ; uses current sky box and wavelength band")
@@ -418,6 +612,10 @@ def main(argv=None):
     p_sim.add_argument("--evidence-only", dest="evidence_only", action="store_true", help="Disable per-row rate priors; use evidences only for posteriors")
     p_sim.add_argument("--no-global-priors", dest="no_global_priors", action="store_true", help="Do not use global prior weights (e.g., PPP expected counts)")
     p_sim.add_argument("--ppp-debug", dest="ppp_debug", action="store_true", help="Enable verbose PPP diagnostics (volumes, z-ranges, selection summaries)")
+    p_sim.add_argument("--load-prior", dest="load_prior", default=None, help="Path to a PriorRecord YAML to apply before simulation/classification")
+    p_sim.add_argument("--save-prior-dir", dest="save_prior_dir", default=None, help="Directory to save per-label PriorRecord snapshots after simulation/classification")
+    # Factorized selection toggle for simulate as well
+    p_sim.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors during simulate/classify run")
     p_sim.set_defaults(func=cmd_simulate)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
