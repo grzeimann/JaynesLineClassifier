@@ -4,7 +4,6 @@ JLC pulls run-time configuration from CLI options and stores them in a shared co
 
 > Rename status: The codebase now prefers `extra_log_likelihood` terminology throughout. Engine/CLI/tests use it end‑to‑end; label classes retain a deprecated `log_evidence` shim (DeprecationWarning, stacklevel=2) delegating to `extra_log_likelihood` for one minor version. Custom labels should implement `extra_log_likelihood(row, ctx)` and may keep a thin `log_evidence` shim during the transition window.
 
-- `f_lim`: flux threshold guiding selection completeness and Fake priors.
 - `wave_min`, `wave_max`: wavelength band for the run (Å).
 - `fake_rate_per_sr_per_A`: fake rate density used in PPP mode and by FakeLabel rate priors.
 - `ppp_expected_counts`: dict of expected counts by label computed during PPP simulation; used as optional global prior weights when normalizing posteriors.
@@ -20,18 +19,17 @@ JLC pulls run-time configuration from CLI options and stores them in a shared co
 
 ## Selection model
 
-By default, `SelectionModel` applies a hard-completeness step at `f_lim`:
-- completeness(F, λ) = 1 if F > f_lim, else 0.
+The SelectionModel now uses S/N-based completeness driven by priors. At runtime, completeness is evaluated via:
+- selection.completeness_sn_array(label_name, F_array, wave_true, ...)
 
-Alternatively, you can enable a smooth tanh completeness curve with `--F50` and `--w`:
-- C(F) = 0.5 · (1 + tanh((F − F50)/w))
-- If `F50` and `w` are provided, they take precedence over `f_lim`.
+How it works:
+- A NoiseModel provides sigma(wave_true[, ra, dec, ifu_id]).
+- Per-label SNCompletenessModel (e.g., logistic_per_lambda_bin) maps S/N_true → C ∈ [0,1].
+- When you load a PriorRecord that contains a `selection` block (default_sigma and selection.sn), the CLI wires these models automatically.
+- If no selection prior is provided, completeness defaults to 1.0 (neutral), preserving previous behavior.
 
-Wavelength-dependent completeness (optional):
-- Provide wavelength-binned tables for F50(λ) and/or w(λ) via `--F50-table` and `--w-table`.
-- File formats supported: `.npz` (preferred; arrays `bins` and `values`) or `.csv` with two columns: `bin_left,value` per row. The last right edge is reconstructed for CSV using the median bin width.
-- Tables override scalar `F50`/`w` within their wavelength domain; outside the table range, scalar values (or legacy behavior) are used.
-- Programmatic I/O: `SelectionModel.save_table(path, bins, values)` and `SelectionModel.load_table(path)`.
+Deprecated:
+- Legacy flux-threshold knobs (f_lim, F50, w, F50-table, w-table, ra-dec-factor) are removed from the CLI and codepaths.
 
 ## Label models
 

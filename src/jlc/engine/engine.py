@@ -21,8 +21,8 @@ class JaynesianEngine:
         except Exception:
             hp = {}
         pop_hp = dict(hp.get("population", {})) if isinstance(hp.get("population", {}), dict) else {}
-        flat_hp = dict(hp) if isinstance(hp, dict) else {}
-        flat_hp.pop("population", None)
+        # Only apply population hyperparameters to label hyperparams. Do NOT merge arbitrary
+        # top-level keys (e.g., measurements, selection) into the dataclass to avoid constructor errors.
         meas_hp = dict(hp.get("measurements", {})) if isinstance(hp.get("measurements", {}), dict) else {}
         for L in self.registry.labels:
             m = self.registry.model(L)
@@ -32,12 +32,19 @@ class JaynesianEngine:
                 rec_label = None
             if rec_label not in (None, "all", L):
                 continue
-            # Merge population hyperparameters
-            to_set = {}
-            to_set.update(pop_hp)
-            to_set.update(flat_hp)
+            # Merge population hyperparameters, filtered to the model's known hyperparam fields
+            to_set = dict(pop_hp)
             if len(to_set) > 0 and hasattr(m, "set_hyperparams"):
                 try:
+                    import dataclasses as _dc
+                    allowed_keys = set()
+                    try:
+                        if hasattr(m, "hyperparam_cls") and m.hyperparam_cls is not None:
+                            allowed_keys = {f.name for f in _dc.fields(m.hyperparam_cls)}
+                    except Exception:
+                        allowed_keys = set(m.get_hyperparams_dict().keys() or [])
+                    if allowed_keys:
+                        to_set = {k: v for k, v in to_set.items() if k in allowed_keys}
                     m.set_hyperparams(**to_set)
                 except Exception:
                     pass
@@ -274,14 +281,6 @@ class JaynesianEngine:
         out = df.copy()
         labels = self.registry.labels
 
-        # Config toggles
-        cfg = getattr(self.ctx, "config", {}) or {}
-        use_rate_priors = bool(cfg.get("use_rate_priors", True))
-        use_global_priors = bool(cfg.get("use_global_priors", True))
-        engine_mode = (mode or cfg.get("engine_mode") or "rate_times_likelihood").strip().lower()
-        if engine_mode not in {"rate_only", "likelihood_only", "rate_times_likelihood"}:
-            engine_mode = "rate_times_likelihood"
-
         # Compute per-row, per-label rate densities and add as diagnostics
         rates = np.zeros((len(out), len(labels)), dtype=float)
 
@@ -302,22 +301,13 @@ class JaynesianEngine:
         # Apply mode and rate prior toggles
         with np.errstate(divide='ignore'):
             logR = np.log(rates + EPS_LOG)
-        if not use_rate_priors:
-            # evidence-only requested via config: neutralize rate priors
-            logR[:, :] = 0.0
-            expose_fake_components = False
-        # Engine mode overrides combination
-        if engine_mode == "rate_only":
-            logZ[:, :] = 0.0
-        elif engine_mode == "likelihood_only":
-            logR[:, :] = 0.0
+
         # else combined: keep both
 
         # Emit per-label rate diagnostics
         for j, L in enumerate(labels):
             out[f"rate_{L}"] = rates[:, j]
 
-        # Combine log rate prior with data evidence
         logP_unnorm = logZ + logR
 
         # log-softmax
@@ -344,9 +334,6 @@ class JaynesianEngine:
         else:
             out["rate_phys_total"] = np.sum(rates, axis=1)
 
-        # Record which priors/mode were applied
-        out["use_rate_priors"] = bool(use_rate_priors)
-        out["engine_mode"] = engine_mode
 
         # If a calibrated/used fake rate is present in context, record it for traceability
         try:

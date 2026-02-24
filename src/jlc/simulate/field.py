@@ -16,7 +16,6 @@ def simulate_field(
     wave_min: float,
     wave_max: float,
     flux_err: float = 1e-17,
-    f_lim: float | None = None,
     fake_rate_per_sr_per_A: float = 0.0,
     seed: int | None = None,
     nz: int = 256,
@@ -37,13 +36,33 @@ def simulate_field(
     # Record common knobs in context for traceability
     try:
         if isinstance(ctx.config, dict):
-            ctx.config["f_lim"] = f_lim if f_lim is not None else ctx.config.get("f_lim", None)
             ctx.config["fake_rate_per_sr_per_A"] = float(fake_rate_per_sr_per_A)
             ctx.config["wave_min"] = float(wave_min)
             ctx.config["wave_max"] = float(wave_max)
             if snr_min is not None:
                 ctx.config["snr_min"] = float(snr_min)
             ctx.config["nz_simulator"] = int(nz)
+    except Exception:
+        pass
+
+    # Align selection noise model's default sigma with the simulation flux_err
+    try:
+        sel = getattr(ctx, "selection", None)
+        if sel is not None and getattr(sel, "noise_model", None) is not None:
+            try:
+                sel.noise_model.default_sigma = float(flux_err)
+            except Exception:
+                pass
+        elif sel is not None:
+            # Attach a simple flat NoiseModel if missing
+            try:
+                from jlc.selection.base import NoiseModel
+                if hasattr(sel, "set_noise_model"):
+                    sel.set_noise_model(NoiseModel(default_sigma=float(flux_err)))
+                else:
+                    setattr(sel, "noise_model", NoiseModel(default_sigma=float(flux_err)))
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -69,7 +88,6 @@ def simulate_field(
                 wave_min=wave_min,
                 wave_max=wave_max,
                 flux_err=flux_err,
-                f_lim=f_lim,
                 fake_rate_per_sr_per_A=fake_rate_per_sr_per_A,
                 rng=rng,
                 nz=nz,
@@ -86,7 +104,6 @@ def simulate_field(
                 wave_min,
                 wave_max,
                 flux_err,
-                f_lim,
                 fake_rate_per_sr_per_A,
                 seed,
                 nz,

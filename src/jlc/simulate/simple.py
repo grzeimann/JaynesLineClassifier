@@ -65,13 +65,21 @@ def plot_distributions(df: pd.DataFrame, prefix: str) -> None:
 
 
 def plot_selection_completeness(selection_model, prefix: str) -> None:
-    """Plot a 2D image of completeness C(F, λ) over the common flux/wave grid.
+    """Plot 2D completeness images C(F, λ) per label panel using S/N completeness.
 
     - Wavelength grid: 3500–5500 Å, 40 linear bins (41 edges). Image x-axis uses edges; evaluate at centers.
     - Flux grid: 1e-18–1e-15, 31 log bins (32 edges). Image y-axis log-scaled; evaluate at centers.
-    Saves to f"{prefix}_selection.png".
+    Saves to f"{prefix}_selection.png" as a multi-panel figure (one panel per label in selection_model).
     """
     import matplotlib.pyplot as plt
+
+    # Determine label list from selection model (per-label SN models); fallback to ['all']
+    try:
+        labels = list(getattr(selection_model, "_sn_models", {}).keys())
+        if len(labels) == 0:
+            labels = ["all"]
+    except Exception:
+        labels = ["all"]
 
     # Shared bin edges and centers (match plot_distributions)
     wave_edges = np.linspace(3500.0, 5500.0, 41)
@@ -80,28 +88,29 @@ def plot_selection_completeness(selection_model, prefix: str) -> None:
     # For log bins, geometric mean is a better center
     flux_centers = np.sqrt(flux_edges[:-1] * flux_edges[1:])
 
-    # Build completeness grid: shape (n_wave, n_flux)
-    nw = wave_centers.size
-    nF = flux_centers.size
-    C = np.zeros((nw, nF), dtype=float)
-    for i, lam in enumerate(wave_centers):
-        C[i, :] = np.clip(selection_model.completeness(flux_centers, float(lam)), 0.0, 1.0)
-
-    # Plot using pcolormesh with edges
-    plt.figure(figsize=(6.5, 4.8))
-    # pcolormesh expects array shaped (ny, nx) for Z when Y,X are 1D edges
-    pcm = plt.pcolormesh(wave_edges, flux_edges, C.T, cmap="viridis", shading="auto", vmin=0.0, vmax=1.0)
-    plt.yscale("log")
-    plt.xlim(3500.0, 5500.0)
-    plt.ylim(1e-18, 1e-15)
-    plt.xlabel("Observed wavelength [A]")
-    plt.ylabel("Flux")
-    cbar = plt.colorbar(pcm)
-    cbar.set_label("Selection completeness C(F, λ)")
-    plt.tight_layout()
+    # Build figure with one panel per label
+    nlab = len(labels)
+    fig, axes = plt.subplots(1, nlab, figsize=(6.0*nlab, 4.8), squeeze=False)
+    axes = axes[0]
+    for ax, lname in zip(axes, labels):
+        nw = wave_centers.size
+        nF = flux_centers.size
+        C = np.zeros((nw, nF), dtype=float)
+        for i, lam in enumerate(wave_centers):
+            C[i, :] = np.clip(selection_model.completeness_sn_array(lname, flux_centers, float(lam)), 0.0, 1.0)
+        pcm = ax.pcolormesh(wave_edges, flux_edges, C.T, cmap="viridis", shading="auto", vmin=0.0, vmax=1.0)
+        ax.set_yscale("log")
+        ax.set_xlim(3500.0, 5500.0)
+        ax.set_ylim(1e-18, 1e-15)
+        ax.set_xlabel("Observed wavelength [A]")
+        ax.set_ylabel("Flux")
+        ax.set_title(str(lname))
+        cbar = fig.colorbar(pcm, ax=ax)
+        cbar.set_label("C(F, λ)")
+    fig.tight_layout()
     out_path = f"{prefix}_selection.png"
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
     try:
         from jlc.utils.logging import log as _log
         _log(f"[jlc.simulate] Wrote selection completeness image to {out_path}")

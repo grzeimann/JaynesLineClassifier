@@ -66,7 +66,7 @@ class OIILabel(LabelModel):
     def rate_density(self, row: pd.Series, ctx) -> float:
         # Use shared helper for observed-space rate density integration (per sr per Å)
         from jlc.core.population_helpers import rate_density_local
-        r = float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection))
+        r = float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection, label_name=self.label))
         # Optional factorized selection multiplier (neutral by default)
         try:
             use_fac = bool(getattr(ctx, "config", {}).get("use_factorized_selection", False))
@@ -147,7 +147,7 @@ class OIILabel(LabelModel):
             return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
                 "label": self.label, "mu": 0.0, "V_Mpc3": 0.0
             }
-        rate, dVdz, dL2 = _rate_grid_per_sr(ctx, self.lf, ctx.selection, self.rest_wave, z_grid, F_grid)
+        rate, dVdz, dL2 = _rate_grid_per_sr(ctx, self.lf, ctx.selection, self.rest_wave, z_grid, F_grid, label_name=self.label)
         r_z = integrate_rate_over_flux(rate, F_grid)
         mu = expected_count_from_rate(r_z, z_grid, omega)
         V = expected_volume_from_dVdz(dVdz, z_grid, omega)
@@ -162,9 +162,9 @@ class OIILabel(LabelModel):
             S_eff = (mu / mu0) if (_np.isfinite(mu0) and mu0 > 0) else _np.nan
         except Exception:
             mu0 = float('nan'); S_eff = float('nan')
-        n = int(max(0, _np.random.poisson(mu) if _np.isfinite(mu) and mu > 0 else 0))
-        from jlc.simulate.model_ppp import _cap_events
-        n = _cap_events(self.label, n, mu)
+        from jlc.simulate.model_ppp import _poisson_safe, _cap_events
+        n_draw = _poisson_safe(rng, mu) if (_np.isfinite(mu) and mu > 0) else 0
+        n = _cap_events(self.label, int(max(0, n_draw)), mu)
         if n <= 0:
             return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
                 "label": self.label, "mu": float(mu), "V_Mpc3": float(V), "mu_no_selection": float(mu0), "S_eff": float(S_eff),

@@ -88,7 +88,7 @@ def _compute_label_grids(ctx, rest_wave: float, wave_min: float, wave_max: float
     return z_grid, F_grid, zmin, zmax
 
 
-def _rate_grid_per_sr(ctx, lf, selection, rest_wave: float, z_grid: np.ndarray, F_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _rate_grid_per_sr(ctx, lf, selection, rest_wave: float, z_grid: np.ndarray, F_grid: np.ndarray, *, label_name: str | None = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute r(z, F) per sr per unit z per unit F for a line label.
 
     r(z,F) = dV/dz(z) * phi_F(F|z) * S(F, lambda_obs), where phi_F = phi_L(L) * dL/dF, L=4π d_L(z)^2 F.
@@ -126,7 +126,7 @@ def _rate_grid_per_sr(ctx, lf, selection, rest_wave: float, z_grid: np.ndarray, 
             phi_L = np.where(mask, phi_L, 0.0)
         dLdF = 4.0 * np.pi * dL2[i]
         phi_F = phi_L * dLdF
-        S = selection.completeness(F_grid, float(lam_obs[i]))
+        S = selection.completeness_sn_array(label_name or "all", F_grid, float(lam_obs[i]))
         # rate per z per F per sr
         rate[i, :] = dVdz[i] * phi_F * S
 

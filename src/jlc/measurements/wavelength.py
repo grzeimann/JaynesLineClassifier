@@ -13,7 +13,18 @@ class WavelengthMeasurement(MeasurementModule):
 
         If wave_err is missing or non-positive, return 0.0 (neutral contribution)
         to avoid penalizing rows lacking wavelength uncertainties.
+
+        If the configured prior type for wavelength is 'deterministic-from-z',
+        this module is neutral (returns 0.0) to avoid double-counting a
+        delta-like constraint implied by the label hypothesis.
         """
+        # If prior indicates deterministic-from-z, be neutral regardless of inputs
+        try:
+            ptype = str(getattr(self, "prior_hyperparams", {}).get("_type", "")).strip().lower()
+            if ptype in ("deterministic-from-z", "deterministic_from_z", "deterministic"):
+                return 0.0
+        except Exception:
+            pass
         try:
             w_true = float(latent.get(self.latent_key, np.nan)) if latent is not None else np.nan
         except Exception:

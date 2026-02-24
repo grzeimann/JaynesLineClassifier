@@ -18,10 +18,10 @@ hyperparams:
           extra_scatter: 0.0
 
   selection:
-    default_sigma: 5.0e-18
+    default_sigma: 1.0e-17
     sn:
       model: "logistic_per_lambda_bin"
       params:
         bins_wave: [3600, 4500, 5400]
-        sn50: [5.5, 5.5, 5.5]
-        width: [1.0, 1.0, 1.0]
+        sn50: [5.5, 5.5]
+        width: [1.0, 1.0]

@@ -130,10 +130,12 @@ def effective_volume_per_L(
     wave_max: float,
     L_vals: np.ndarray,
     nz: int = 512,
+    *,
+    label_name: str | None = None,
 ) -> np.ndarray:
     """Compute effective volume V_eff(L) by integrating Ω ∫ dV/dz · S(F(L,z), λobs(z)) dz.
 
-    Evaluates selection at each z as completeness(F_array, scalar_lambda), looping over z for robustness.
+    Uses S/N-based completeness via SelectionModel.completeness_sn_array.
     """
     if not (np.isfinite(omega_sr) and omega_sr > 0):
         return np.zeros_like(np.asarray(L_vals, dtype=float))
@@ -149,7 +151,7 @@ def effective_volume_per_L(
     # Evaluate selection column-wise over z to respect SelectionModel API
     S = np.zeros_like(F_Lz)
     for j in range(z_grid.size):
-        Sj = selection.completeness(F_Lz[:, j], float(lam_obs[j]))
+        Sj = selection.completeness_sn_array(label_name or "all", F_Lz[:, j], float(lam_obs[j]))
         # ensure shape (nL,)
         Sj = np.asarray(Sj, dtype=float).reshape(-1)
         if Sj.size != F_Lz.shape[0]:
@@ -196,7 +198,7 @@ def binned_lf_simulated(
     widths = np.diff(edges)
     centers = 0.5 * (edges[:-1] + edges[1:])
     L_centers = 10.0 ** centers
-    V_eff_bins = effective_volume_per_L(cosmo, selection, rest, omega_sr, wave_min, wave_max, L_centers, nz=nz)
+    V_eff_bins = effective_volume_per_L(cosmo, selection, rest, omega_sr, wave_min, wave_max, L_centers, nz=nz, label_name=label)
     V_eff_bins = np.where(V_eff_bins > 0, V_eff_bins, np.nan)
     phi = counts / (V_eff_bins * widths)
     err = np.sqrt(np.maximum(counts, 0.0)) / (V_eff_bins * widths)
@@ -274,7 +276,7 @@ def binned_lf_inferred(
     widths = np.diff(edges)
     centers = 0.5 * (edges[:-1] + edges[1:])
     L_centers = 10.0 ** centers
-    V_eff_bins = effective_volume_per_L(cosmo, selection, rest, omega_sr, wave_min, wave_max, L_centers, nz=nz)
+    V_eff_bins = effective_volume_per_L(cosmo, selection, rest, omega_sr, wave_min, wave_max, L_centers, nz=nz, label_name=label)
     V_eff_bins = np.where(V_eff_bins > 0, V_eff_bins, np.nan)
     phi = counts / (V_eff_bins * widths)
     err = np.sqrt(np.maximum(w2, 0.0)) / (V_eff_bins * widths)
@@ -292,11 +294,15 @@ def binned_lf_inferred(
 def default_log10L_bins_from_registry(registry, nbins: int = 20, span_decades: Tuple[float, float] = (-3.0, 3.0)) -> Dict[str, np.ndarray]:
     """Build default log10 L bins for LAE and OII based on their L* in the registry LFs."""
     out: Dict[str, np.ndarray] = {}
+    # Look up labels independently so absence of one does not prevent the other
     try:
         lae = registry.model("lae")
-        oii = registry.model("oii")
         if hasattr(lae, "lf") and hasattr(lae.lf, "log10_Lstar"):
             out["lae"] = _build_log10L_bins_from_Lstar(float(lae.lf.log10_Lstar), nbins, span_decades)
+    except Exception:
+        pass
+    try:
+        oii = registry.model("oii")
         if hasattr(oii, "lf") and hasattr(oii.lf, "log10_Lstar"):
             out["oii"] = _build_log10L_bins_from_Lstar(float(oii.lf.log10_Lstar), nbins, span_decades)
     except Exception:

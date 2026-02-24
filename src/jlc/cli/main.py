@@ -14,12 +14,12 @@ from jlc.labels.fake import FakeLabel
 from jlc.population.schechter import SchechterLF
 from jlc.cosmology.lookup import AstropyCosmology
 from jlc.selection.base import SelectionModel
+from jlc.selection import build_selection_model_from_priors
 from jlc.measurements.flux import FluxMeasurement
 from jlc.measurements.wavelength import WavelengthMeasurement
 from jlc.simulate.simple import SkyBox, plot_distributions, plot_selection_completeness
 from jlc.simulate.field import simulate_field as simulate_field_api
 from jlc.utils.logging import log
-from jlc.utils.cli_helpers import load_ra_dec_factor, load_completeness_tables
 from jlc.priors import PriorRecord, load_prior_record, save_prior_record, apply_prior_to_label
 
 # Named defaults to avoid magic numbers sprinkled around
@@ -27,45 +27,24 @@ FLUXGRID_DEFAULT_MIN = 1e-18
 FLUXGRID_DEFAULT_MAX = 1e-14
 FLUXGRID_DEFAULT_N = 128
 
-def build_default_context_and_registry(f_lim: float | None = None, wave_min: float | None = None, wave_max: float | None = None, volume_mode: str | None = None,
+def build_default_context_and_registry(wave_min: float | None = None, wave_max: float | None = None, volume_mode: str | None = None,
                                         n_fibers: int | None = None, ifu_count: int | None = None, exposure_scale: float | None = None,
-                                        search_measure_scale: float | None = None, F50: float | None = None, w: float | None = None,
-                                        F50_table: dict | tuple | None = None, w_table: dict | tuple | None = None,
-                                        fluxgrid_min: float | None = None, fluxgrid_max: float | None = None, fluxgrid_n: int | None = None,
-                                        ra_dec_factor: object | None = None):
+                                        search_measure_scale: float | None = None,
+                                        fluxgrid_min: float | None = None, fluxgrid_max: float | None = None, fluxgrid_n: int | None = None):
     # Context with simple caches
     cosmo = AstropyCosmology()
-    selection = SelectionModel(f_lim=f_lim, F50=F50, w=w, F50_table=F50_table, w_table=w_table, ra_dec_factor=ra_dec_factor)
+    selection = SelectionModel()
     # Build a configurable FluxGrid with optional guards around selection thresholds
     # Start with defaults
     fg_Fmin = FLUXGRID_DEFAULT_MIN if fluxgrid_min is None else float(fluxgrid_min)
     fg_Fmax = FLUXGRID_DEFAULT_MAX if fluxgrid_max is None else float(fluxgrid_max)
     fg_n = FLUXGRID_DEFAULT_N if fluxgrid_n is None else int(fluxgrid_n)
-    # Guard to ensure grid meaningfully covers selection thresholds
-    thr = None
-    if F50 is not None:
-        thr = float(F50)
-    elif f_lim is not None:
-        thr = float(f_lim)
-    if thr is not None and np.isfinite(thr) and thr > 0:
-        # expand grid to straddle threshold comfortably
-        fg_Fmin = min(fg_Fmin, max(thr * THRESH_FACTOR_LOW, FLUX_MIN_FLOOR))
-        fg_Fmax = max(fg_Fmax, thr * THRESH_FACTOR_HIGH)
-    # Build FluxGrid and ensure it straddles any provided selection threshold
+    # Build FluxGrid
     _fg = FluxGrid(Fmin=fg_Fmin, Fmax=fg_Fmax, n=fg_n)
-    try:
-        if thr is not None and np.isfinite(thr) and thr > 0:
-            _fg.ensure_threshold(thr, factor_low=THRESH_FACTOR_LOW, factor_high=THRESH_FACTOR_HIGH)
-    except Exception:
-        pass
     caches = {
         "flux_grid": _fg,
     }
-    config = {"f_lim": f_lim}
-    if F50 is not None:
-        config["F50"] = float(F50)
-    if w is not None:
-        config["w"] = float(w)
+    config = {}
     if wave_min is not None:
         config["wave_min"] = float(wave_min)
     if wave_max is not None:
@@ -130,21 +109,20 @@ def build_default_context_and_registry(f_lim: float | None = None, wave_min: flo
 
 
 def _apply_prior_record_to_runtime(record: PriorRecord, registry, ctx) -> None:
-    """Apply a PriorRecord to labels and measurement modules in-place.
+    """Apply a PriorRecord to labels, measurement modules, and optionally selection in-place.
 
     - population: shallow-merge into label hyperparams (accepts either flat keys
       matching dataclass fields, or under a 'population' block).
     - measurements: if present, set noise/prior hyperparams for matching modules
       by name (e.g., 'flux', 'wavelength').
+    - selection: if a selection.sn block is present, build S/N selection and
+      attach to ctx.selection (guarded, non-breaking).
     """
     try:
         hp = record.hyperparams or {}
     except Exception:
         hp = {}
     pop_hp = dict(hp.get("population", {})) if isinstance(hp.get("population", {}), dict) else {}
-    flat_hp = dict(hp) if isinstance(hp, dict) else {}
-    # avoid duplicating nested keys when shallow-merging later
-    flat_hp.pop("population", None)
     meas_hp = dict(hp.get("measurements", {})) if isinstance(hp.get("measurements", {}), dict) else {}
     # Apply to each label model that matches
     for L in registry.labels:
@@ -152,12 +130,22 @@ def _apply_prior_record_to_runtime(record: PriorRecord, registry, ctx) -> None:
         # label filter
         if record.label not in (None, "all", L):
             continue
-        # population hyperparams (prefer nested block, then flat fallback)
-        to_set = {}
-        to_set.update(pop_hp)
-        to_set.update(flat_hp)
+        # population hyperparams (apply only recognized fields)
+        to_set = dict(pop_hp)
         if len(to_set) > 0 and hasattr(m, "set_hyperparams"):
             try:
+                import dataclasses as _dc
+                allowed_keys = set()
+                try:
+                    if hasattr(m, "hyperparam_cls") and m.hyperparam_cls is not None:
+                        allowed_keys = {f.name for f in _dc.fields(m.hyperparam_cls)}
+                except Exception:
+                    try:
+                        allowed_keys = set(m.get_hyperparams_dict().keys() or [])
+                    except Exception:
+                        allowed_keys = set()
+                if allowed_keys:
+                    to_set = {k: v for k, v in to_set.items() if k in allowed_keys}
                 m.set_hyperparams(**to_set)
             except Exception:
                 pass
@@ -176,9 +164,18 @@ def _apply_prior_record_to_runtime(record: PriorRecord, registry, ctx) -> None:
                     nz_params = {}
                 try:
                     pr = blk.get("prior", {}) or {}
+                    # Extract params dict if present, otherwise treat block as flat params
                     pr_params = dict(pr.get("params", {})) if isinstance(pr.get("params", {}), dict) else dict(pr)
                 except Exception:
                     pr_params = {}
+                # If the block carried a type, preserve it under a reserved key for modules to inspect
+                try:
+                    pr_type = pr.get("type", None) if isinstance(pr, dict) else None
+                    if pr_type is not None:
+                        pr_params = dict(pr_params)
+                        pr_params["_type"] = str(pr_type)
+                except Exception:
+                    pass
                 if len(nz_params) > 0:
                     try:
                         mod.noise_hyperparams.update(nz_params)
@@ -191,6 +188,31 @@ def _apply_prior_record_to_runtime(record: PriorRecord, registry, ctx) -> None:
                         mod.prior_hyperparams = dict(pr_params)
         except Exception:
             pass
+    # Optional: apply selection S/N model from prior (guarded)
+    try:
+        sel_blk = (hp.get("selection", {}) if isinstance(hp, dict) else {}) or {}
+        if sel_blk.get("sn"):
+            # build a temp SelectionModel carrying noise_model and one SN model
+            tmp_sel = build_selection_model_from_priors(record)
+            if tmp_sel is not None:
+                # attach noise model if provided
+                if getattr(tmp_sel, "noise_model", None) is not None:
+                    try:
+                        ctx.selection.set_noise_model(tmp_sel.noise_model)
+                    except Exception:
+                        setattr(ctx.selection, "noise_model", tmp_sel.noise_model)
+                # attach per-label SN model
+                lname = record.label or "all"
+                snm = tmp_sel.sn_model_for_label(lname)
+                if snm is not None:
+                    try:
+                        ctx.selection.set_sn_model_for(lname, snm)
+                    except Exception:
+                        # Fallback: internal map may be private; try attribute
+                        if hasattr(ctx.selection, "_sn_models"):
+                            ctx.selection._sn_models[lname] = snm
+    except Exception:
+        pass
     # record path for provenance if available
     try:
         if isinstance(ctx.config, dict):
@@ -202,12 +224,11 @@ def _apply_prior_record_to_runtime(record: PriorRecord, registry, ctx) -> None:
 
 def cmd_classify(args) -> int:
     df = pd.read_csv(args.input)
-    # Optional completeness tables
-    F50_table, w_table = load_completeness_tables(args, caller="jlc.classify")
-    ra_dec_fn = load_ra_dec_factor(getattr(args, "ra_dec_factor", None))
-    ctx, registry = build_default_context_and_registry(F50=getattr(args, "F50", None), w=getattr(args, "w", None), F50_table=F50_table, w_table=w_table,
-                                         fluxgrid_min=getattr(args, "fluxgrid_min", None), fluxgrid_max=getattr(args, "fluxgrid_max", None), fluxgrid_n=getattr(args, "fluxgrid_n", None),
-                                         ra_dec_factor=ra_dec_fn)
+    ctx, registry = build_default_context_and_registry(
+        fluxgrid_min=getattr(args, "fluxgrid_min", None),
+        fluxgrid_max=getattr(args, "fluxgrid_max", None),
+        fluxgrid_n=getattr(args, "fluxgrid_n", None),
+    )
     # Optionally load and apply a PriorRecord
     if getattr(args, "load_prior", None):
         # Accept either a single YAML path or a directory containing multiple prior YAMLs
@@ -283,8 +304,6 @@ def cmd_simulate(args) -> int:
     # Build sky
     sky = SkyBox(args.ra_low, args.ra_high, args.dec_low, args.dec_high)
 
-    # Optional completeness tables
-    F50_table, w_table = load_completeness_tables(args, caller="jlc.simulate")
 
     # Optional: calibrate a homogeneous fake rate ρ̂ from a virtual catalog
     if getattr(args, "calibrate_fake_rate_from", None):
@@ -306,9 +325,7 @@ def cmd_simulate(args) -> int:
             log(f"[jlc.simulate] Warning: failed to calibrate fake rate from {args.calibrate_fake_rate_from}: {e}")
 
     # Build context/registry first for model-driven PPP
-    ra_dec_fn = load_ra_dec_factor(getattr(args, "ra_dec_factor", None))
     ctx, registry = build_default_context_and_registry(
-        f_lim=args.f_lim,
         wave_min=args.wave_min,
         wave_max=args.wave_max,
         volume_mode=args.volume_mode,
@@ -316,14 +333,9 @@ def cmd_simulate(args) -> int:
         ifu_count=getattr(args, "ifu_count", None),
         exposure_scale=getattr(args, "exposure_scale", None),
         search_measure_scale=getattr(args, "search_measure_scale", None),
-        F50=getattr(args, "F50", None),
-        w=getattr(args, "w", None),
-        F50_table=F50_table,
-        w_table=w_table,
         fluxgrid_min=getattr(args, "fluxgrid_min", None),
         fluxgrid_max=getattr(args, "fluxgrid_max", None),
         fluxgrid_n=getattr(args, "fluxgrid_n", None),
-        ra_dec_factor=ra_dec_fn,
     )
 
     # Optionally load and apply a PriorRecord
@@ -364,6 +376,31 @@ def cmd_simulate(args) -> int:
     except Exception:
         pass
 
+    # Ensure selection NoiseModel default_sigma follows --flux-err unless explicitly overridden later
+    try:
+        from jlc.selection.base import NoiseModel
+        sel = getattr(ctx, "selection", None)
+        if sel is not None and getattr(args, "flux_err", None) is not None:
+            sigma_cli = float(args.flux_err)
+            # If no noise model configured (e.g., no prior with selection block), attach one
+            if getattr(sel, "noise_model", None) is None:
+                try:
+                    sel.set_noise_model(NoiseModel(default_sigma=sigma_cli))
+                except Exception:
+                    setattr(sel, "noise_model", NoiseModel(default_sigma=sigma_cli))
+            else:
+                # Update the default sigma to match the CLI flux_err
+                try:
+                    sel.noise_model.default_sigma = sigma_cli
+                except Exception:
+                    # Replace if immutable/problematic
+                    try:
+                        sel.set_noise_model(NoiseModel(default_sigma=sigma_cli))
+                    except Exception:
+                        setattr(sel, "noise_model", NoiseModel(default_sigma=sigma_cli))
+    except Exception:
+        pass
+
     # Propagate fake rate into context config for rate-density prior use
     try:
         if isinstance(ctx.config, dict):
@@ -389,7 +426,6 @@ def cmd_simulate(args) -> int:
         wave_min=args.wave_min,
         wave_max=args.wave_max,
         flux_err=args.flux_err,
-        f_lim=args.f_lim,
         fake_rate_per_sr_per_A=args.fake_rate,
         seed=args.seed,
         nz=args.nz,
@@ -404,13 +440,7 @@ def cmd_simulate(args) -> int:
     # Classify using the same context/registry (PPP path reuses them)
     engine = JaynesianEngine(registry, ctx)
     out = engine.compute_extra_log_likelihood_matrix(df)
-    # Use PPP expected counts as priors if available
-    log_prior_weights = None
-    if isinstance(getattr(ctx, "config", None), dict) and "ppp_expected_counts" in ctx.config:
-        mu = ctx.config["ppp_expected_counts"]
-        # Ensure only known labels and positive counts contribute
-        log_prior_weights = {L: (np.log(max(mu.get(L, 0.0), EPS_LOG))) for L in registry.labels}
-    out = engine.normalize_posteriors(out, log_prior_weights=log_prior_weights)
+    out = engine.normalize_posteriors(out)
     if args.out_classified:
         out.to_csv(args.out_classified, index=False)
 
@@ -545,16 +575,8 @@ def main(argv=None):
     p_classify = sub.add_parser("classify", help="Classify a catalog CSV")
     p_classify.add_argument("input", help="Input CSV path")
     p_classify.add_argument("--out", required=True, help="Output CSV path")
-    # SelectionModel smooth completeness knobs (optional)
-    p_classify.add_argument("--F50", dest="F50", type=float, default=None, help="Flux at 50% completeness for smooth tanh selection (overrides f_lim if set)")
-    p_classify.add_argument("--w", dest="w", type=float, default=None, help="Transition width for smooth tanh selection (requires F50)")
-    p_classify.add_argument("--F50-table", dest="F50_table", default=None, help="Path to F50(λ) table (.npz or .csv with bin_left,value)")
-    p_classify.add_argument("--w-table", dest="w_table", default=None, help="Path to w(λ) table (.npz or .csv with bin_left,value)")
     p_classify.add_argument("--evidence-only", dest="evidence_only", action="store_true", help="Disable per-row rate priors; use evidences only for posteriors")
-    p_classify.add_argument("--no-global-priors", dest="no_global_priors", action="store_true", help="Do not use global prior weights (e.g., PPP expected counts)")
     p_classify.add_argument("--engine-mode", dest="engine_mode", choices=["rate_only", "likelihood_only", "rate_times_likelihood"], default=None, help="Posterior mode: combine rate prior and likelihood, or isolate one component")
-    # RA/Dec-dependent selection modulation
-    p_classify.add_argument("--ra-dec-factor", dest="ra_dec_factor", default=None, help="Load RA/Dec modulation function as module:function; signature g(ra, dec, lam)->[0,1]")
     # FluxGrid configuration (optional)
     p_classify.add_argument("--fluxgrid-min", dest="fluxgrid_min", type=float, default=None, help="Minimum flux for FluxGrid (default 1e-18 if unset)")
     p_classify.add_argument("--fluxgrid-max", dest="fluxgrid_max", type=float, default=None, help="Maximum flux for FluxGrid (default 1e-14 if unset)")
@@ -573,14 +595,6 @@ def main(argv=None):
     p_sim.add_argument("--dec-high", dest="dec_high", type=float, default=5.0)
     p_sim.add_argument("--wave-min", dest="wave_min", type=float, default=4800.0)
     p_sim.add_argument("--wave-max", dest="wave_max", type=float, default=9800.0)
-    p_sim.add_argument("--f-lim", dest="f_lim", type=float, default=1e-17, help="Flux threshold for selection (used if smooth tanh not set)")
-    # SelectionModel smooth completeness knobs (optional)
-    p_sim.add_argument("--F50", dest="F50", type=float, default=None, help="Flux at 50% completeness for smooth tanh selection (overrides f_lim if set)")
-    p_sim.add_argument("--w", dest="w", type=float, default=None, help="Transition width for smooth tanh selection (requires F50)")
-    p_sim.add_argument("--F50-table", dest="F50_table", default=None, help="Path to F50(λ) table (.npz or .csv with bin_left,value)")
-    p_sim.add_argument("--w-table", dest="w_table", default=None, help="Path to w(λ) table (.npz or .csv with bin_left,value)")
-    # RA/Dec-dependent selection modulation
-    p_sim.add_argument("--ra-dec-factor", dest="ra_dec_factor", default=None, help="Load RA/Dec modulation function as module:function; signature g(ra, dec, lam)->[0,1]")
     p_sim.add_argument("--flux-err", dest="flux_err", type=float, default=5e-18, help="Per-object flux error")
     p_sim.add_argument("--wave-err", dest="wave_err", type=float, default=0.0, help="Per-object wavelength error (Å) for measurement modules and simulation hooks")
     p_sim.add_argument("--snr-min", dest="snr_min", type=float, default=None, help="Minimum S/N (flux_hat/flux_err) to include a detection in the simulated catalog")
@@ -610,7 +624,6 @@ def main(argv=None):
     p_sim.add_argument("--lf-inferred-hard", dest="lf_inferred_hard", action="store_true", help="Use hard (argmax) derived labels for inferred LF instead of posterior-weighted counts")
     # Posterior control toggles
     p_sim.add_argument("--evidence-only", dest="evidence_only", action="store_true", help="Disable per-row rate priors; use evidences only for posteriors")
-    p_sim.add_argument("--no-global-priors", dest="no_global_priors", action="store_true", help="Do not use global prior weights (e.g., PPP expected counts)")
     p_sim.add_argument("--ppp-debug", dest="ppp_debug", action="store_true", help="Enable verbose PPP diagnostics (volumes, z-ranges, selection summaries)")
     p_sim.add_argument("--load-prior", dest="load_prior", default=None, help="Path to a PriorRecord YAML to apply before simulation/classification")
     p_sim.add_argument("--save-prior-dir", dest="save_prior_dir", default=None, help="Directory to save per-label PriorRecord snapshots after simulation/classification")

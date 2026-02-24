@@ -3,6 +3,7 @@ import pandas as pd
 from dataclasses import dataclass
 from .base import LabelModel
 from jlc.population.schechter import SchechterLF
+from jlc.core.population_helpers import rate_density_local
 
 
 @dataclass
@@ -68,26 +69,7 @@ class LAELabel(LabelModel):
         return self.hyperparam_cls()
 
     def rate_density(self, row: pd.Series, ctx) -> float:
-        # Use shared helper for observed-space rate density integration (per sr per Å)
-        from jlc.core.population_helpers import rate_density_local
-        r = float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection))
-        # Optional factorized selection multiplier (neutral by default)
-        try:
-            use_fac = bool(getattr(ctx, "config", {}).get("use_factorized_selection", False))
-        except Exception:
-            use_fac = False
-        if use_fac and self.selection is not None:
-            try:
-                wave_obs = float(row.get("wave_obs", np.nan))
-                F_hat = float(row.get("flux_hat", np.nan))
-                latent = {"F_true": float(F_hat) if np.isfinite(F_hat) else 0.0,
-                          "wave_true": float(wave_obs) if np.isfinite(wave_obs) else float(self.rest_wave)}
-                c_fac = float(self.selection.completeness_factorized(self, latent, self.measurement_modules, ctx))
-                if np.isfinite(c_fac) and c_fac >= 0:
-                    r *= c_fac
-            except Exception:
-                pass
-        return r
+        return float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection, label_name=self.label))
 
     def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
         """Measurement-only evidence marginalized over latent flux (neutral prior on F)."""
@@ -153,7 +135,7 @@ class LAELabel(LabelModel):
             return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
                 "label": self.label, "mu": 0.0, "V_Mpc3": 0.0
             }
-        rate, dVdz, dL2 = _rate_grid_per_sr(ctx, self.lf, ctx.selection, self.rest_wave, z_grid, F_grid)
+        rate, dVdz, dL2 = _rate_grid_per_sr(ctx, self.lf, ctx.selection, self.rest_wave, z_grid, F_grid, label_name=self.label)
         r_z = integrate_rate_over_flux(rate, F_grid)
         mu = expected_count_from_rate(r_z, z_grid, omega)
         V = expected_volume_from_dVdz(dVdz, z_grid, omega)
@@ -168,10 +150,9 @@ class LAELabel(LabelModel):
             S_eff = (mu / mu0) if (_np.isfinite(mu0) and mu0 > 0) else _np.nan
         except Exception:
             mu0 = float('nan'); S_eff = float('nan')
-        n = int(max(0, _np.random.poisson(mu) if _np.isfinite(mu) and mu > 0 else 0))
-        # guard with cap similar to legacy
-        from jlc.simulate.model_ppp import _cap_events
-        n = _cap_events(self.label, n, mu)
+        from jlc.simulate.model_ppp import _poisson_safe, _cap_events
+        n_draw = _poisson_safe(rng, mu) if (_np.isfinite(mu) and mu > 0) else 0
+        n = _cap_events(self.label, int(max(0, n_draw)), mu)
         if n <= 0:
             return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
                 "label": self.label, "mu": float(mu), "V_Mpc3": float(V), "mu_no_selection": float(mu0), "S_eff": float(S_eff),

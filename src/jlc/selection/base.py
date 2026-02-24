@@ -1,285 +1,240 @@
+from __future__ import annotations
 import numpy as np
+from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
 from typing import Optional, Tuple, Dict, Any
 
 
-class SelectionModel:
-    """Standalone selection completeness model C(F, λ[, RA, Dec]) ∈ [0,1].
+# ==========================
+# Noise and S/N completeness
+# ==========================
 
-    - Hard threshold via f_lim or smooth tanh via F50, w.
-    - Optional wavelength-binned tables F50(λ), w(λ) overriding scalars within table domain.
-    - Optional RA/Dec modulation factor g(ra, dec, λ) ∈ [0,1] applied multiplicatively.
+@dataclass
+class NoiseModel:
+    """Noise model mapping (wave_true, RA, Dec, IFU) → sigma.
 
-    Extended API per measurements-priors spec:
-    - completeness_factorized(label, latent, measurements, ctx): combine per-measurement
-      completeness factors without breaking existing callers.
+    Phase 1: flat sigma or 1D wavelength table. Spatial inputs are accepted for
+    future extensions but ignored here.
     """
-    def __init__(
-        self,
-        f_lim: float | None = None,
-        F50: float | None = None,
-        w: float | None = None,
-        F50_table: Optional[Tuple[np.ndarray, np.ndarray]] | Optional[Dict[str, Any]] = None,
-        w_table: Optional[Tuple[np.ndarray, np.ndarray]] | Optional[Dict[str, Any]] = None,
-        ra_dec_factor: Any | None = None,
-    ):
-        """Selection model with smooth or hard completeness.
+    wave_grid: Optional[np.ndarray] = None
+    sigma_wave: Optional[np.ndarray] = None
+    default_sigma: float = 1.0
 
-        Parameters
-        ----------
-        f_lim : float | None
-            Legacy hard threshold. If provided and no (F50,w) are given, use C(F) = 1[F > f_lim].
-        F50 : float | None
-            Flux at 50% completeness for the smooth tanh model. If provided (with w), overrides f_lim.
-        w : float | None
-            Transition width for the smooth tanh model. Larger w makes a gentler roll-off.
-        F50_table : (bins, values) tuple or dict, optional
-            Optional wavelength-binned F50(λ) table. If provided, overrides scalar F50 when evaluating at a given λ.
-            Bins are edges of length N+1 (Å), values length N.
-        w_table : (bins, values) tuple or dict, optional
-            Optional wavelength-binned w(λ) table. If provided, overrides scalar w when evaluating at a given λ.
-
-        Behavior
-        --------
-        - If both F50 and w (after applying any λ-tables) are provided (finite and >0), use the smooth model:
-              C(F) = 0.5 * (1 + tanh((F - F50) / w))
-        - Else if f_lim is provided, use hard threshold: C(F) = 1[F > f_lim]
-        - Else return C(F)=1 for all F (legacy behavior).
-        """
-        self.f_lim = float(f_lim) if f_lim is not None else None
-        self.F50 = float(F50) if F50 is not None else None
-        self.w = float(w) if w is not None else None
-        self._F50_table = self._sanitize_table(F50_table)
-        self._w_table = self._sanitize_table(w_table)
-        # Optional RA/Dec-dependent multiplicative factor g(ra,dec,λ) ∈ [0,1]
-        # Accepts a callable or None. If provided as a dict in future, callers
-        # should wrap their loader as a callable to avoid tight coupling here.
-        self._ra_dec_factor = ra_dec_factor if callable(ra_dec_factor) else None
-
-    # Convenience vector API per refactor plan
-    def completeness_vector(self, df, out_col: str = "completeness"):
-        """Compute completeness for each row of a DataFrame.
-
-        Uses flux_hat if available, otherwise flux_true. Requires wave_obs.
-        Optionally uses RA/Dec columns if available via ra_dec_factor.
-        Returns a new Series and does not modify the input unless out_col is provided
-        and the caller assigns it.
-        """
+    def sigma(self, wave_true: float, ra: float | None = None, dec: float | None = None, ifu_id: int | None = None) -> float:
         try:
-            import pandas as _pd  # local import to avoid hard dep at import time
-            if not isinstance(df, _pd.DataFrame):
-                return None
-            lam = _pd.to_numeric(df.get("wave_obs"), errors="coerce").to_numpy(dtype=float)
-            ra = _pd.to_numeric(df.get("ra"), errors="coerce").to_numpy(dtype=float) if "ra" in df.columns else None
-            dec = _pd.to_numeric(df.get("dec"), errors="coerce").to_numpy(dtype=float) if "dec" in df.columns else None
-            # prefer measured flux
-            Fh = _pd.to_numeric(df.get("flux_hat"), errors="coerce").to_numpy(dtype=float) if "flux_hat" in df.columns else None
-            if Fh is None or not np.any(np.isfinite(Fh)):
-                Fh = _pd.to_numeric(df.get("flux_true"), errors="coerce").to_numpy(dtype=float) if "flux_true" in df.columns else None
-            if Fh is None:
-                # if no flux available, return NaNs
-                return _pd.Series(np.full(len(df), np.nan), index=df.index, name=out_col)
-            # Evaluate row-wise to respect current completeness(F, scalar λ) API
-            out = np.empty(len(df), dtype=float)
-            for i in range(len(df)):
-                Fi = Fh[i]
-                li = lam[i] if i < lam.size else np.nan
-                rai = ra[i] if ra is not None and i < ra.size else None
-                deci = dec[i] if dec is not None and i < dec.size else None
-                if not np.isfinite(Fi) or not np.isfinite(li):
-                    out[i] = np.nan
-                    continue
-                ci = self.completeness(np.asarray([Fi], dtype=float), float(li), ra=rai, dec=deci)
-                out[i] = float(ci[0]) if np.size(ci) > 0 else np.nan
-            return _pd.Series(out, index=df.index, name=out_col)
+            # Try wavelength-dependent lookup if configured
+            if self.wave_grid is not None and self.sigma_wave is not None:
+                idx = int(np.argmin(np.abs(np.asarray(self.wave_grid, dtype=float) - float(wave_true))))
+                s = float(np.asarray(self.sigma_wave, dtype=float)[idx])
+                return float(s if np.isfinite(s) and s > 0 else self.default_sigma)
         except Exception:
-            return None
+            pass
+        return float(self.default_sigma)
 
-    # --- Table I/O helpers ---
-    @staticmethod
-    def save_table(path: str, bins: np.ndarray, values: np.ndarray) -> None:
-        """Save a (bins, values) completeness table to disk.
-        Supports .npz (preferred) or .csv with two columns: left_edge,value per row.
-        """
-        bins = np.asarray(bins, dtype=float)
-        values = np.asarray(values, dtype=float)
-        if bins.ndim != 1 or values.ndim != 1 or bins.size != values.size + 1:
-            raise ValueError("Invalid table: bins must have length N+1 and values length N")
-        if path.lower().endswith(".npz"):
-            import numpy as _np
-            _np.savez_compressed(path, bins=bins, values=values)
-        elif path.lower().endswith(".csv"):
-            import csv
-            with open(path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["bin_left", "value"])  # header
-                for i in range(values.size):
-                    w.writerow([bins[i], values[i]])
-                # optionally include rightmost edge as a comment-like last row (NaN,value)
-        else:
-            raise ValueError("Unsupported file extension for table; use .npz or .csv")
 
-    @staticmethod
-    def load_table(path: str) -> Dict[str, np.ndarray]:
-        """Load a completeness table saved by save_table() or a compatible producer.
-        Returns a dict with keys {bins, values}.
-        """
-        if path.lower().endswith(".npz"):
-            import numpy as _np
-            with _np.load(path, allow_pickle=False) as data:
-                bins = _np.asarray(data["bins"], dtype=float)
-                values = _np.asarray(data["values"], dtype=float)
-        elif path.lower().endswith(".csv"):
-            import numpy as _np
-            import csv
-            lefts = []
-            vals = []
-            with open(path, "r", newline="") as f:
-                r = csv.reader(f)
-                header = next(r, None)
-                for row in r:
-                    if not row:
-                        continue
-                    try:
-                        lefts.append(float(row[0]))
-                        vals.append(float(row[1]))
-                    except Exception:
-                        continue
-            lefts = _np.asarray(lefts, dtype=float)
-            vals = _np.asarray(vals, dtype=float)
-            if lefts.size == 0 or vals.size == 0 or lefts.size != vals.size:
-                raise ValueError("CSV table must have at least one row and matching columns")
-            # reconstruct rightmost edge by extending the last bin by the median width
-            widths = _np.diff(lefts)
-            wmed = float(_np.median(widths)) if widths.size > 0 else 1.0
-            bins = _np.concatenate([lefts, [lefts[-1] + wmed]])
-            values = vals
-        else:
-            raise ValueError("Unsupported table file; use .npz or .csv")
-        if bins.ndim != 1 or values.ndim != 1 or bins.size != values.size + 1:
-            raise ValueError("Loaded table has invalid shapes (bins N+1, values N)")
-        return {"bins": bins, "values": values}
+class SNCompletenessModel(ABC):
+    """Abstract base for completeness as a function of S/N_true and wavelength."""
 
-    @staticmethod
-    def _sanitize_table(tbl: Optional[Tuple[np.ndarray, np.ndarray]] | Optional[Dict[str, Any]]):
-        if tbl is None:
-            return None
+    @abstractmethod
+    def completeness(self, sn_true: float, wave_true: float, latent: Dict[str, Any]) -> float:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+@dataclass
+class SNLogisticPerLambdaBin(SNCompletenessModel):
+    """Logistic S/N completeness with wavelength-bin dependence.
+
+    C = 0.5 * (1 + tanh((S/N_true - sn50_j)/width_j)) for λ in bin j.
+    """
+    wave_bins: np.ndarray
+    sn50: np.ndarray
+    width: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.wave_bins = np.asarray(self.wave_bins, dtype=float)
+        self.sn50 = np.asarray(self.sn50, dtype=float)
+        self.width = np.asarray(self.width, dtype=float)
+        if self.wave_bins.size != self.sn50.size + 1:
+            raise ValueError("wave_bins must have length len(sn50)+1")
+        if self.width.size != self.sn50.size:
+            raise ValueError("width must have same length as sn50")
+
+    def _bin_index(self, wave_true: float) -> int:
+        j = int(np.searchsorted(self.wave_bins, float(wave_true), side="right") - 1)
+        return int(np.clip(j, 0, self.sn50.size - 1))
+
+    def completeness(self, sn_true: float, wave_true: float, latent: Dict[str, Any]) -> float:
         try:
-            if isinstance(tbl, tuple) and len(tbl) == 2:
-                bins = np.asarray(tbl[0], dtype=float)
-                vals = np.asarray(tbl[1], dtype=float)
-            elif isinstance(tbl, dict):
-                bins = np.asarray(tbl.get("bins"), dtype=float)
-                vals = np.asarray(tbl.get("values"), dtype=float)
-            else:
-                return None
-            if bins.ndim != 1 or vals.ndim != 1:
-                return None
-            if bins.size != vals.size + 1 or bins.size < 2:
-                return None
-            if not (np.all(np.isfinite(bins)) and np.all(np.isfinite(vals))):
-                return None
-            if not np.all(np.diff(bins) > 0):
-                return None
-            return {"bins": bins, "values": vals}
-        except Exception:
-            return None
-
-    @staticmethod
-    def _value_from_table(lam: float, table: Optional[Dict[str, np.ndarray]]):
-        if table is None or not np.isfinite(lam):
-            return None
-        try:
-            bins = table["bins"]
-            vals = table["values"]
-            if lam < bins[0] or lam > bins[-1]:
-                return None
-            idx = int(np.searchsorted(bins, lam, side="right") - 1)
-            idx = int(np.clip(idx, 0, vals.size - 1))
-            v = float(vals[idx])
-            return v if np.isfinite(v) else None
-        except Exception:
-            return None
-
-    def completeness_single(self, F: float, wave_obs: float, ra: float | None = None, dec: float | None = None, context: Any | None = None) -> float:
-        """Scalar convenience wrapper: C(F, λ[, RA, Dec]).
-        RA/Dec/context are accepted; RA/Dec optionally modulate completeness via ra_dec_factor.
-        """
-        try:
-            c = self.completeness(np.asarray([float(F)], dtype=float), float(wave_obs), ra=ra, dec=dec)
-            v = float(c[0]) if np.size(c) > 0 else 0.0
-            return float(np.clip(v, 0.0, 1.0))
+            j = self._bin_index(wave_true)
+            x = (float(sn_true) - float(self.sn50[j])) / float(self.width[j])
+            c = 0.5 * (1.0 + np.tanh(x))
+            if not np.isfinite(c):
+                return 0.0
+            return float(np.clip(c, 0.0, 1.0))
         except Exception:
             return 0.0
 
-    def completeness(self, F: np.ndarray, wave_obs: float, ra: float | None = None, dec: float | None = None) -> np.ndarray:
-        """Return selection completeness in [0,1] for each flux value at given wave.
 
-        Notes
-        -----
-        - Vectorized over F.
-        - Supports optional wavelength dependence via binned F50(λ) and w(λ) tables.
-        - Optionally modulated by an RA/Dec-dependent factor g(ra,dec,λ)∈[0,1] when provided.
-        - Guarantees outputs in [0,1].
-        """
-        F = np.asarray(F, dtype=float)
-        # Effective per-wavelength parameters if tables provided
-        F50_eff = self._value_from_table(wave_obs, self._F50_table)
-        if F50_eff is None:
-            F50_eff = self.F50
-        w_eff = self._value_from_table(wave_obs, self._w_table)
-        if w_eff is None:
-            w_eff = self.w
-        # Smooth tanh model if configured and sane
-        if F50_eff is not None and w_eff is not None and np.isfinite(F50_eff) and np.isfinite(w_eff) and w_eff > 0:
-            x = (F - F50_eff) / w_eff
-            C = 0.5 * (1.0 + np.tanh(x))
-        elif self.f_lim is not None and np.isfinite(self.f_lim):
-            # Hard threshold fallback
-            C = (F > self.f_lim).astype(float)
+class SelectionModel:
+    """Selection model supporting S/N-based completeness per label.
+
+    New API:
+    - completeness_sn(label_or_name, F_array, wave_true[, ra, dec, ifu_id]) → array in [0,1]
+      Uses noise_model.sigma(wave_true, ...) to compute S/N_true = F/sigma and applies the
+      per-label SNCompletenessModel if configured. Safe fallback to ones if ingredients are missing.
+
+    Legacy shim paths for flux-threshold completeness have been removed from the codebase.
+    """
+    def __init__(
+        self,
+        noise_model: NoiseModel | None = None,
+        sn_models: Dict[str, SNCompletenessModel] | None = None,
+        # Deprecated/ignored legacy knobs for backward compatibility:
+        f_lim: float | None = None,
+        F50: float | None = None,
+        w: float | None = None,
+        **kwargs,
+    ):
+        # Incremental redesign: optional noise model and S/N models mapping
+        self.noise_model: NoiseModel | None = noise_model
+        self._sn_models: Dict[str, SNCompletenessModel] = dict(sn_models or {})
+        # Silently accept legacy knobs to avoid breaking older tests/callers.
+        # They have no effect in the new S/N-based completeness path.
+        self._deprecated_f_lim = f_lim
+        self._deprecated_F50 = F50
+        self._deprecated_w = w
+
+    # --------- Incremental S/N-based completeness hooks (optional) ---------
+    def set_noise_model(self, noise_model: NoiseModel | None) -> None:
+        self.noise_model = noise_model
+
+    def set_sn_model_for(self, label_name: str, model: SNCompletenessModel | None) -> None:
+        if model is None:
+            self._sn_models.pop(str(label_name), None)
         else:
-            # Legacy: always selected
-            C = np.ones_like(F)
-        # Optional RA/Dec modulation (multiplicative), applied uniformly across F values for this row
-        if self._ra_dec_factor is not None and (ra is not None or dec is not None):
-            try:
-                g = float(self._ra_dec_factor(ra, dec, float(wave_obs)))
-                if not np.isfinite(g):
-                    g = 1.0
-                g = float(np.clip(g, 0.0, 1.0))
-                C = C * g
-            except Exception:
-                # ignore RA/Dec factor errors to preserve robustness
-                pass
-        return np.clip(C, 0.0, 1.0)
+            self._sn_models[str(label_name)] = model
 
-    # ---------------- Factorized completeness over measurements ----------------
-    def completeness_factorized(self, label, latent: Dict[str, Any], measurements, ctx) -> float:
-        """Combine per-measurement completeness factors multiplicatively.
+    def sn_model_for_label(self, label_name: str) -> SNCompletenessModel | None:
+        return self._sn_models.get(str(label_name))
 
-        This non-breaking API allows selection effects that depend on multiple
-        measurements (or their latents) without requiring a joint grid.
-        Defaults to 1.0 for each measurement unless overridden by subclasses.
+    def completeness(self, label, latent: Dict[str, Any]) -> float:
+        """Evaluate S/N-based completeness for a single latent using label object.
+
+        Returns 1.0 if any ingredient is missing. Safe clamps to [0,1].
         """
         try:
-            c = 1.0
-            for m in (measurements or []):
-                c *= float(self._completeness_for_measurement(label, m, latent, ctx))
+            if self.noise_model is None:
+                return 1.0
+            lname = getattr(label, "label", str(label))
+            model = self.sn_model_for_label(lname)
+            if model is None:
+                return 1.0
+            F_true = float(latent.get("F_true", 0.0))
+            wave_true = float(latent.get("wave_true", 0.0))
+            if not (np.isfinite(F_true) and F_true > 0 and np.isfinite(wave_true) and wave_true > 0):
+                return 0.0
+            sigma = float(self.noise_model.sigma(wave_true, ra=latent.get("ra"), dec=latent.get("dec"), ifu_id=latent.get("ifu_id")))
+            if not (np.isfinite(sigma) and sigma > 0):
+                return 0.0
+            sn_true = F_true / sigma
+            c = float(model.completeness(sn_true, wave_true, latent))
             if not np.isfinite(c) or c < 0:
                 return 0.0
             return float(np.clip(c, 0.0, 1.0))
         except Exception:
             return 1.0
 
-    def _completeness_for_measurement(self, label, measurement, latent: Dict[str, Any], ctx) -> float:
-        """Per-measurement hook. Default returns 1.0 (no effect).
+    # New vectorized array API replacing legacy flux-threshold completeness
+    def completeness_sn_array(
+        self,
+        label_or_name: Any,
+        F_array: np.ndarray,
+        wave_true: float,
+        *,
+        ra: float | None = None,
+        dec: float | None = None,
+        ifu_id: int | None = None,
+    ) -> np.ndarray:
+        """Return per-flux completeness values in [0,1] using S/N-based model.
 
-        Subclasses may override to implement dependencies like S/N cuts that
-        involve a measurement's observed or latent value.
+        If noise_model or the label's SN model are not set, returns an array of ones.
         """
         try:
-            # Example: if measurement provides a latent_key and a value is present, we could
-            # implement simple thresholds based on prior hyperparams in ctx.config or elsewhere.
-            # For now, neutral factor.
-            return 1.0
+            F = np.asarray(F_array, dtype=float)
         except Exception:
-            return 1.0
+            F = np.array(F_array, dtype=float)
+        if F.size == 0:
+            return np.asarray(F, dtype=float)
+        # Missing pieces → neutral (ones)
+        if self.noise_model is None:
+            return np.ones_like(F, dtype=float)
+        lname = getattr(label_or_name, "label", str(label_or_name))
+        model = self.sn_model_for_label(lname)
+        if model is None:
+            return np.ones_like(F, dtype=float)
+        try:
+            sigma = float(self.noise_model.sigma(float(wave_true), ra=ra, dec=dec, ifu_id=ifu_id))
+        except Exception:
+            sigma = float("nan")
+        if not (np.isfinite(sigma) and sigma > 0):
+            return np.zeros_like(F, dtype=float)
+        sn = np.where(sigma > 0, F / sigma, 0.0)
+        # Evaluate per element in the given wavelength bin
+        out = np.empty_like(F, dtype=float)
+        for i, s in enumerate(np.ravel(sn)):
+            try:
+                c = float(model.completeness(float(s), float(wave_true), {"ra": ra, "dec": dec, "ifu_id": ifu_id}))
+            except Exception:
+                c = 1.0
+            if not np.isfinite(c):
+                c = 0.0
+            out[i] = float(np.clip(c, 0.0, 1.0))
+        return out.reshape(F.shape)
+
+# -----------------------------
+# Factory from PriorRecord
+# -----------------------------
+
+def build_selection_model_from_priors(record: Any, *, default_sigma: float = 1.0, label_name: str | None = None) -> SelectionModel | None:
+    """Build a SelectionModel with NoiseModel + S/N completeness from a PriorRecord.
+
+    Expected schema under record.hyperparams:
+      selection:
+        default_sigma: <float>  # optional
+        sn:
+          model: "logistic_per_lambda_bin"
+          params:
+            bins_wave: [...]
+            sn50: [...]
+            width: [...]
+
+    Returns None if required blocks are missing. Callers can keep existing
+    SelectionModel in that case. The returned SelectionModel includes the
+    configured NoiseModel and an SN completeness entry bound to `label_name`
+    (or record.label if label_name is None).
+    """
+    try:
+        hp = getattr(record, "hyperparams", {}) or {}
+        sel_hp = hp.get("selection", {}) or {}
+        sn_hp = sel_hp.get("sn", {}) or {}
+        model_name = str(sn_hp.get("model", "")).strip().lower()
+        params = dict(sn_hp.get("params", {})) if isinstance(sn_hp.get("params", {}), dict) else {}
+        # Build NoiseModel (default_sigma only for now)
+        nm = NoiseModel(default_sigma=float(sel_hp.get("default_sigma", default_sigma)))
+        # Build SN completeness model
+        sn_model = None
+        if model_name in ("logistic_per_lambda_bin", "sn_logistic_per_lambda_bin", "logistic"):
+            bins = params.get("bins_wave") or params.get("wave_bins")
+            sn50 = params.get("sn50")
+            width = params.get("width")
+            if bins is None or sn50 is None or width is None:
+                return None
+            sn_model = SNLogisticPerLambdaBin(np.asarray(bins, dtype=float), np.asarray(sn50, dtype=float), np.asarray(width, dtype=float))
+        else:
+            return None
+        sel = SelectionModel(noise_model=nm, sn_models={})
+        lname = label_name or getattr(record, "label", None) or "all"
+        sel.set_sn_model_for(str(lname), sn_model)
+        return sel
+    except Exception:
+        return None

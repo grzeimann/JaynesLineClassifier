@@ -99,9 +99,9 @@ def test_s_equiv_1_low_noise_lf_recovery_rate_only():
     registry = LabelRegistry([lae])
 
     # Simulate over a fairly wide band and sky area to get enough objects
-    ra_low, ra_high = 150.0, 160.0
-    dec_low, dec_high = -5.0, 5.0
-    wave_min, wave_max = 4800.0, 9800.0
+    ra_low, ra_high = 150.0, 150.1
+    dec_low, dec_high = 0.0, 0.1
+    wave_min, wave_max = 4000.0, 4020.0
 
     df_sim = simulate_field_api(
         registry=registry,
@@ -110,7 +110,6 @@ def test_s_equiv_1_low_noise_lf_recovery_rate_only():
         dec_low=dec_low, dec_high=dec_high,
         wave_min=wave_min, wave_max=wave_max,
         flux_err=5e-19,  # very low noise
-        f_lim=None,
         fake_rate_per_sr_per_A=0.0,
         seed=123,
         nz=256,

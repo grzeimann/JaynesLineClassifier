@@ -7,7 +7,9 @@ This page explains how to persist and reuse priors for labels and measurements u
 A PriorRecord is a YAML (or JSON) file that stores hyperparameters with provenance metadata. For label scope, it typically contains:
 - population: label hyperparameters (e.g., Schechter LF or fake prior parameters)
 - measurements: per-measurement priors and noise model hyperparameters keyed by measurement name (e.g., flux, wavelength)
-- selection: optional selection-related hyperparams (reserved; current SelectionModel reads directly from CLI/config)
+- selection: selection-related hyperparams for S/N-based completeness, applied automatically by the CLI when loading a prior:
+  - default_sigma: fallback flux error used to convert flux → S/N when no table is provided
+  - sn: { model, params } e.g. logistic_per_lambda_bin with bins_wave, sn50, width
 
 Minimal dataclass (see jlc.priors.record):
 - name, scope, label
@@ -97,7 +99,7 @@ print(registry.model("oii").get_hyperparams_dict())
 jlc simulate \
   --ra-low 150 --ra-high 150.5 --dec-low 0 --dec-high 0.5 \
   --wave-min 4800 --wave-max 9800 \
-  --f-lim 1e-17 --flux-err 5e-18 \
+  --flux-err 5e-18 \
   --fake-rate 2e3 \
   --out-catalog sim_catalog.csv \
   --out-classified sim_classified.csv \

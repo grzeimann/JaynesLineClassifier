@@ -96,12 +96,17 @@ def phi_flux_from_lf(lf, F: np.ndarray, z: float, cosmo) -> np.ndarray:
     return phi_L_from_lf(lf, L)
 
 
-def completeness(selection, F: np.ndarray, lam_obs: float) -> np.ndarray:
-    """Convenience wrapper that clamps to [0,1] and handles selection=None."""
+def completeness(selection, F: np.ndarray, lam_obs: float, label_name: str | None = None) -> np.ndarray:
+    """S/N-based completeness wrapper using SelectionModel.completeness_sn_array.
+
+    Falls back to ones if selection/noise/SN model are not configured.
+    """
+    F = np.asarray(F, dtype=float)
     if selection is None:
         return np.ones_like(F, dtype=float)
     try:
-        C = selection.completeness(np.asarray(F, dtype=float), float(lam_obs))
+        lname = str(label_name) if label_name is not None else "all"
+        C = selection.completeness_sn_array(lname, F, float(lam_obs))
         C = np.clip(np.asarray(C, dtype=float), 0.0, 1.0)
         return C
     except Exception:
@@ -118,6 +123,8 @@ def rate_density_integrand_per_flux(
     rest_wave: float,
     z: float,
     cosmo,
+    *,
+    label_name: str | None = None,
 ) -> Tuple[np.ndarray, float, float]:
     """Return r_F(F,λ) array per (sr·Å·flux) and auxiliary factors.
 
@@ -140,7 +147,7 @@ def rate_density_integrand_per_flux(
     dLdF = FOURPI * dL2  # derivative of L wrt F at fixed z
     # LF and selection
     phi = phi_flux_from_lf(lf, F, z, cosmo)
-    S = completeness(selection, F, lam_obs)
+    S = completeness(selection, F, lam_obs, label_name=label_name)
     # Jacobian |dz/dλ|
     jac = jac_dz_dlambda(rest_wave)
     rF = dVdz * (phi * dLdF) * S * jac
@@ -155,6 +162,8 @@ def rate_density_local(
     rest_wave: float,
     lf,
     selection,
+    *,
+    label_name: str | None = None,
 ) -> float:
     """Observed-space rate density at measured flux: r(λ, F_hat) per sr per Å.
 
@@ -196,7 +205,7 @@ def rate_density_local(
     # If error is invalid or zero, evaluate at delta: r_F(F_hat, λ)
     if not (np.isfinite(sigma) and sigma > 0):
         F_eval = np.array([F_hat], dtype=float)
-        rF, _dv, _dl2 = rate_density_integrand_per_flux(lf, selection, F_eval, lam, rest_wave, z, ctx.cosmo)
+        rF, _dv, _dl2 = rate_density_integrand_per_flux(lf, selection, F_eval, lam, rest_wave, z, ctx.cosmo, label_name=label_name)
         r = float(rF[0])
         try:
             from jlc.rates.observed_space import effective_search_measure
@@ -204,47 +213,21 @@ def rate_density_local(
         except Exception:
             pass
         return max(r, 0.0)
-    # Build true-flux grid: prefer shared FluxGrid for consistency; fallback to local grid
-    used_fluxgrid = False
-    F_grid_true = None
-    try:
-        fg = getattr(getattr(ctx, "caches", {}), "get", lambda k, d=None: None)("flux_grid") if hasattr(getattr(ctx, "caches", {}), "get") else getattr(ctx.caches, "flux_grid", None)
-        if fg is None:
-            fg = getattr(ctx.caches if hasattr(ctx, "caches") else {}, "flux_grid", None)
-        if fg is not None and hasattr(fg, "grid"):
-            Fg, _logw = fg.grid(row)
-            Fg = np.asarray(Fg, dtype=float)
-            # sanitize: keep finite and non-negative
-            Fg = Fg[np.isfinite(Fg) & (Fg >= 0.0)]
-            if Fg.size >= 2:
-                F_grid_true = Fg
-                used_fluxgrid = True
-    except Exception:
-        pass
-    if F_grid_true is None:
-        # Fallback: local F_true grid centered on F_hat covering several sigmas
-        try:
-            cfg = getattr(ctx, "config", {}) or {}
-            nsig = float(cfg.get("flux_marg_nsigma", 6.0) or 6.0)
-        except Exception:
-            nsig = 6.0
-        nsig = 6.0 if not np.isfinite(nsig) or nsig <= 0 else float(nsig)
-        F_min = max(0.0, F_hat - nsig * sigma)
-        F_max = F_hat + nsig * sigma
-        # Ensure non-degenerate span; extend if necessary
-        span = F_max - F_min
-        if not (np.isfinite(span) and span > 0):
-            F_min = max(0.0, F_hat)
-            F_max = F_min + max(sigma, 1e-30)
-        # Number of grid points (can be tuned via config)
-        try:
-            Nf = int(getattr(ctx, "config", {}).get("flux_marg_npts", 256) or 256)
-        except Exception:
-            Nf = 256
-        Nf = max(int(Nf), 16)
-        F_grid_true = np.linspace(F_min, F_max, Nf, dtype=float)
+
+    fg = getattr(getattr(ctx, "caches", {}), "get", lambda k, d=None: None)("flux_grid") if hasattr(getattr(ctx, "caches", {}), "get") else getattr(ctx.caches, "flux_grid", None)
+    if fg is None:
+        fg = getattr(ctx.caches if hasattr(ctx, "caches") else {}, "flux_grid", None)
+    if fg is not None and hasattr(fg, "grid"):
+        Fg, _logw = fg.grid(row)
+        Fg = np.asarray(Fg, dtype=float)
+        # sanitize: keep finite and non-negative
+        Fg = Fg[np.isfinite(Fg) & (Fg >= 0.0)]
+        if Fg.size >= 2:
+            F_grid_true = Fg
+
+
     # Evaluate LF×selection integrand r_F(F_true, λ)
-    rF, _dVdz, _dL2 = rate_density_integrand_per_flux(lf, selection, F_grid_true, lam, rest_wave, z, ctx.cosmo)
+    rF, _dVdz, _dL2 = rate_density_integrand_per_flux(lf, selection, F_grid_true, lam, rest_wave, z, ctx.cosmo, label_name=label_name)
     # Measurement PDF p(F_hat | F_true) assuming Gaussian noise on flux_hat
     # p = N(F_hat; mean=F_true, sigma)
     inv_s = 1.0 / sigma
@@ -254,11 +237,5 @@ def rate_density_local(
     # Convolution integral over F_true
     integrand = rF * p_meas
     r = float(np.trapz(integrand, x=F_grid_true))
-    # Apply effective search measure as a final multiplier
-    try:
-        from jlc.rates.observed_space import effective_search_measure
-        r *= float(effective_search_measure(row, ctx))
-    except Exception:
-        pass
     return max(r, 0.0)
 
