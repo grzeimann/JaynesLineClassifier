@@ -3,6 +3,8 @@ import pandas as pd
 from dataclasses import dataclass
 from .base import LabelModel
 from jlc.population.schechter import SchechterLF
+from jlc.utils.logging import log
+from jlc.core.population_helpers import rate_density_local
 
 
 @dataclass
@@ -65,25 +67,7 @@ class OIILabel(LabelModel):
 
     def rate_density(self, row: pd.Series, ctx) -> float:
         # Use shared helper for observed-space rate density integration (per sr per Å)
-        from jlc.core.population_helpers import rate_density_local
-        r = float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection, label_name=self.label))
-        # Optional factorized selection multiplier (neutral by default)
-        try:
-            use_fac = bool(getattr(ctx, "config", {}).get("use_factorized_selection", False))
-        except Exception:
-            use_fac = False
-        if use_fac and self.selection is not None:
-            try:
-                wave_obs = float(row.get("wave_obs", np.nan))
-                F_hat = float(row.get("flux_hat", np.nan))
-                latent = {"F_true": float(F_hat) if np.isfinite(F_hat) else 0.0,
-                          "wave_true": float(wave_obs) if np.isfinite(wave_obs) else float(self.rest_wave)}
-                c_fac = float(self.selection.completeness_factorized(self, latent, self.measurement_modules, ctx))
-                if np.isfinite(c_fac) and c_fac >= 0:
-                    r *= c_fac
-            except Exception:
-                pass
-        return r
+        return float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection, label_name=self.label))
 
     def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
         """Measurement-only evidence marginalized over F with neutral prior."""
@@ -151,23 +135,37 @@ class OIILabel(LabelModel):
         r_z = integrate_rate_over_flux(rate, F_grid)
         mu = expected_count_from_rate(r_z, z_grid, omega)
         V = expected_volume_from_dVdz(dVdz, z_grid, omega)
-        # Diagnostics
-        try:
-            class _UnitSel:
-                def completeness(self, F, wave):
-                    return _np.ones_like(F, dtype=float)
-            rate0, _dVdz0, _dL20 = _rate_grid_per_sr(ctx, self.lf, _UnitSel(), self.rest_wave, z_grid, F_grid)
-            r_z0 = integrate_rate_over_flux(rate0, F_grid)
-            mu0 = expected_count_from_rate(r_z0, z_grid, omega)
-            S_eff = (mu / mu0) if (_np.isfinite(mu0) and mu0 > 0) else _np.nan
-        except Exception:
-            mu0 = float('nan'); S_eff = float('nan')
+        # --- Diagnostics: compare expected count rate with population_helpers ---
+        lam_grid = self.rest_wave * (1.0 + z_grid)
+        dlam = float(lam_grid[-1] - lam_grid[0]) if lam_grid.size >= 2 else float("nan")
+        jac = 1.0 / float(self.rest_wave)  # |dz/dλ|
+        # Convert simulator path to per sr per Angstrom
+        r_lambda_from_z = r_z * jac  # per sr per Å
+
+        # Integrate over λ to get counts per sr across the band
+        mu_per_sr_from_z = float(np.trapz(r_lambda_from_z, x=lam_grid))
+        # Band-averaged per-Å rate densities (per sr per Å)
+        rbar_from_z = (mu_per_sr_from_z / dlam) if (np.isfinite(dlam) and dlam > 0) else float("nan")
+        # Convert to current sky area and to a 50"x50" box
+        mu_from_z_check = mu_per_sr_from_z * float(omega)
+        # 50 arcsec box solid angle (small-angle approx): (50" in rad)^2
+        arcsec_to_rad = np.deg2rad(1.0/3600.0)
+        side_rad = 50.0 * arcsec_to_rad
+        omega_box = float(side_rad * side_rad)
+        mu_box_from_z = mu_per_sr_from_z * omega_box
+        rbar_box_from_z = rbar_from_z * omega_box
+        # Logs
+
+        log(
+            f"[oii.simulate_catalog] 50\"×50\" box (Ω_box≈{omega_box:.3e} sr): counts from_z={mu_box_from_z:.3e},; "
+            f"rates per Å in box: r̄_from_z={rbar_box_from_z:.3e}"
+        )
         from jlc.simulate.model_ppp import _poisson_safe, _cap_events
         n_draw = _poisson_safe(rng, mu) if (_np.isfinite(mu) and mu > 0) else 0
         n = _cap_events(self.label, int(max(0, n_draw)), mu)
         if n <= 0:
             return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
-                "label": self.label, "mu": float(mu), "V_Mpc3": float(V), "mu_no_selection": float(mu0), "S_eff": float(S_eff),
+                "label": self.label, "mu": float(mu), "V_Mpc3": float(V),
                 "rest_wave": float(self.rest_wave), "zmin": float(zmin), "zmax": float(zmax)
             }
         idx_z, p_z = sample_z_indices(rng, z_grid, r_z, n)
@@ -192,5 +190,5 @@ class OIILabel(LabelModel):
             "flux_hat": F_hat,
             "flux_err": F_err,
         })
-        return df, {"label": self.label, "mu": float(mu), "V_Mpc3": float(V), "mu_no_selection": float(mu0), "S_eff": float(S_eff),
+        return df, {"label": self.label, "mu": float(mu), "V_Mpc3": float(V),
                     "rest_wave": float(self.rest_wave), "zmin": float(zmin), "zmax": float(zmax)}

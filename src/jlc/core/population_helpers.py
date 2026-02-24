@@ -225,6 +225,7 @@ def rate_density_local(
         if Fg.size >= 2:
             F_grid_true = Fg
 
+    # Need better grid than F_grid_True
 
     # Evaluate LF×selection integrand r_F(F_true, λ)
     rF, _dVdz, _dL2 = rate_density_integrand_per_flux(lf, selection, F_grid_true, lam, rest_wave, z, ctx.cosmo, label_name=label_name)
