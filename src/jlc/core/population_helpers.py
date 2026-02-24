@@ -5,13 +5,28 @@ Shared LF + PPP helper functions used by physical labels (LAE, OII, ...).
 This module centralizes geometry, unit conversions, and observed-space rate
 integrands so we can reason about and test the math in a single place.
 
-Notation and units:
-- Cosmology methods (luminosity_distance, dV_dz) are assumed to return distances
-  in Mpc and comoving volume element in Mpc^3 / sr / dz, respectively.
-- Flux F is in CGS (erg s^-1 cm^-2) as usual.
-- Luminosity L is in CGS (erg s^-1).
-- The observed-space rate density returned by helpers integrates to counts per
-  steradian per Angstrom across flux: r(\lambda) = \int dF r_F(F,\lambda).
+Core definitions (with units):
+- Cosmology methods (luminosity_distance, dV_dz) return distances in Mpc and the
+  comoving volume element in Mpc^3 / sr / dz, respectively.
+- Flux F is in CGS (erg s^-1 cm^-2); luminosity L is in CGS (erg s^-1).
+- Redshift–wavelength relation: λ_obs = λ_rest · (1+z), hence |dz/dλ| = 1/λ_rest.
+
+Observed-space rate density:
+- Define the per-flux integrand
+      r_F(F, λ) = dV/dz(z) · [ϕ(L(F,z)) · dL/dF] · S(F, λ) · |dz/dλ|
+  Units: counts per (sr · Å · flux).
+- Integrating over flux gives the per-wavelength rate density
+      r(λ) = ∫ dF r_F(F, λ)
+  Units: counts per (sr · Å).
+- Integrating r(λ) over λ gives counts per sr across the band.
+
+Connection to r(z):
+- If we omit the |dz/dλ| factor, and instead integrate over flux in z-space, we
+  obtain r(z) per (sr · dz). Multiplying by |dz/dλ| converts it to per Å.
+
+These helpers are the single source of truth for unit conventions; simulation
+code should reference them for clarity. See rate_density_integrand_per_flux and
+rate_density_per_lambda.
 """
 import numpy as np
 from typing import Tuple
@@ -154,6 +169,46 @@ def rate_density_integrand_per_flux(
     # sanitize
     rF = np.where(np.isfinite(rF) & (rF >= 0.0), rF, 0.0)
     return rF, dVdz, dL2
+
+
+def integrate_over_flux(y: np.ndarray, F_grid: np.ndarray) -> float:
+    """Stable trapezoidal integration over flux.
+
+    Returns ∫ y(F) dF with guards for non-finite or empty inputs.
+    """
+    F = np.asarray(F_grid, dtype=float)
+    Y = np.asarray(y, dtype=float)
+    if F.size == 0 or Y.size == 0 or F.size != Y.size:
+        return 0.0
+    if not np.all(np.isfinite(F)):
+        F = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
+    Y = np.where(np.isfinite(Y), Y, 0.0)
+    try:
+        return float(np.trapz(Y, x=F))
+    except Exception:
+        return 0.0
+
+
+def rate_density_per_lambda(
+    lf,
+    selection,
+    F_grid: np.ndarray,
+    lam_obs: float,
+    rest_wave: float,
+    z: float,
+    cosmo,
+    *,
+    label_name: str | None = None,
+) -> Tuple[float, np.ndarray, float, float]:
+    """Compute r(λ) per sr per Å by integrating r_F(F,λ) over flux.
+
+    Returns (r_lambda, rF, dVdz, dL2_cm).
+    """
+    rF, dVdz, dL2 = rate_density_integrand_per_flux(
+        lf, selection, F_grid, lam_obs, rest_wave, z, cosmo, label_name=label_name
+    )
+    r_lambda = integrate_over_flux(rF, F_grid)
+    return float(r_lambda), rF, dVdz, dL2
 
 
 def rate_density_local(

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from .base import LabelModel
 from jlc.types import EvidenceResult
 from jlc.utils.constants import EPS_LOG
+from jlc.core.population_helpers import completeness
 
 
 @dataclass
@@ -99,12 +100,16 @@ class FakeLabel(LabelModel):
             return 1.0
 
     def rate_density(self, row: pd.Series, ctx) -> float:
-        """Flux-conditioned fake rate per sr per Å.
+        """Flux-conditioned fake rate per sr per Å (observed-space PPP prior).
 
-        r_fake(λ, F_hat) = ρ(λ) · ∫ dF_true p_fake(F_true) · S(F_true,λ) · p(F_hat|F_true)
+        Definition mirrors the physical-label helpers in jlc.core.population_helpers:
+            r_fake(λ, F_hat) = ρ(λ) · ∫ dF_true p_fake(F_true) · S(F_true,λ) · p(F_hat|F_true)
         where p_fake is the lognormal prior configured by (mu_ln_offset, sigma_ln),
-        S is selection completeness, and p(F_hat|F_true) is Gaussian with sigma=flux_err.
-        Multiplies by effective_search_measure(row, ctx).
+        S is selection completeness (via population_helpers.completeness), and
+        p(F_hat|F_true) is Gaussian with sigma=flux_err. The result is per sr per Å,
+        consistent with rate_density_local used by LAE/OII.
+
+        Multiplies by effective_search_measure(row, ctx) upstream if enabled.
         """
         # Base λ-shape
         try:
@@ -166,11 +171,9 @@ class FakeLabel(LabelModel):
                 Nf = 256
             Nf = max(int(Nf), 32)
             F_grid_true = np.linspace(F_min, F_max, Nf, dtype=float)
-        # Selection completeness
-        sel = self.selection
+        # Selection completeness (shared helper for consistency)
         try:
-            S = sel.completeness_sn_array("fake", F_grid_true, float(lam)) if sel is not None else np.ones_like(F_grid_true)
-            S = np.clip(np.asarray(S, dtype=float), 0.0, 1.0)
+            S = completeness(self.selection, F_grid_true, float(lam), label_name="fake")
         except Exception:
             S = np.ones_like(F_grid_true)
         # Prior over F_true (lognormal pdf in linear F)

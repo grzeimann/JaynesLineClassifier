@@ -89,9 +89,20 @@ def _compute_label_grids(ctx, rest_wave: float, wave_min: float, wave_max: float
 
 
 def _rate_grid_per_sr(ctx, lf, selection, rest_wave: float, z_grid: np.ndarray, F_grid: np.ndarray, *, label_name: str | None = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute r(z, F) per sr per unit z per unit F for a line label.
+    """Compute r(z, F) with units counts per (sr · dz · flux) for a line label.
 
-    r(z,F) = dV/dz(z) * phi_F(F|z) * S(F, lambda_obs), where phi_F = phi_L(L) * dL/dF, L=4π d_L(z)^2 F.
+    Definition (z-space):
+        r(z,F) = dV/dz(z) · [ϕ(L(F,z)) · dL/dF] · S(F, λ_obs)
+    where ϕ is the LF in luminosity space evaluated at L = 4π d_L(z)^2 F,
+    and S is the selection completeness.
+
+    Notes on units and relation to observed-space helpers:
+    - This function works in z-space (per dz). To obtain per-Å quantities,
+      multiply the flux-integrated r(z) by |dz/dλ| = 1/rest_wave.
+    - The observed-space modular helpers in jlc.core.population_helpers define
+      r_F(F,λ) per (sr · Å · flux) including the |dz/dλ| Jacobian. Integrating
+      r_F over flux gives r(λ) per (sr · Å). Both pathways are consistent.
+
     Returns (rate_grid, dVdz_grid, dL2_grid) for possible reuse.
     """
     # Precompute cosmology terms on z grid

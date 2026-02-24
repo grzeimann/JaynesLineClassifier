@@ -70,10 +70,64 @@ class LAELabel(LabelModel):
         return self.hyperparam_cls()
 
     def rate_density(self, row: pd.Series, ctx) -> float:
+        """Observed-space prior rate density r(λ) for this label at the row’s wavelength.
+
+        Definition and units:
+        - Returns the per-wavelength rate density r(λ) with units counts per (sr · Å).
+        - r(λ) is obtained by integrating, over latent flux F, the per-flux integrand
+              r_F(F, λ) = dV/dz · [ϕ(L(F,z)) · dL/dF] · S(F, λ) · |dz/dλ|
+          which has units counts per (sr · Å · flux).
+        - The required Jacobian |dz/dλ| = 1/rest_wave is handled inside the shared
+          population helpers that this method delegates to.
+
+        Implementation notes:
+        - Uses population_helpers.rate_density_local to do the unit-consistent
+          computation based on the Schechter LF (self.lf), the selection model
+          (self.selection), and the cosmology attached to the context.
+        - The observed wavelength is taken from row['wave_obs']; if invalid, the
+          helper returns 0.0.
+
+        Parameters
+        ----------
+        row : pandas.Series
+            Must contain at least 'wave_obs' (Å). Other fields may be used by
+            the selection model or measurement modules.
+        ctx : object
+            Execution context with caches (e.g., FluxGrid) and cosmology.
+
+        Returns
+        -------
+        float
+            The rate density r(λ) in counts per (sr · Å) at the row’s wavelength.
+        """
         return float(rate_density_local(row, ctx, self.rest_wave, self.lf, self.selection, label_name=self.label))
 
     def extra_log_likelihood(self, row: pd.Series, ctx) -> float:
-        """Measurement-only evidence marginalized over latent flux (neutral prior on F)."""
+        """Flux-marginalized measurement evidence log p(data | label, ctx).
+
+        What this computes:
+        - Returns the log-evidence obtained by integrating out the latent true
+          flux F on the shared FluxGrid with a neutral prior (given by the
+          grid’s quadrature weights). No population (LF) prior is applied here.
+        - For each grid value F, the method sums measurement module
+          log-likelihoods m.log_likelihood(row, latent, ctx), where latent
+          includes F_true=F and the deterministic wavelength from z.
+        - The integration is performed in log-space using FluxGrid.logsumexp
+          with the grid’s log-weights, providing numerical stability.
+
+        Inputs/assumptions:
+        - row must contain 'wave_obs' (Å). This determines z via
+          z = wave_obs / rest_wave - 1. If z is invalid (non-finite or <= 0),
+          the function returns -inf to exclude impossible configurations.
+        - ctx.caches['flux_grid'] must be present and provide (F_grid, log_w)
+          via .grid(row), and a stable .logsumexp utility.
+
+        Output and units:
+        - Returns a scalar float equal to log ∫ dF p(data | F, z, ctx) w(F),
+          where w(F) encodes a neutral prior via grid weights. This is a
+          dimensionless log-probability contribution independent of the
+          population-rate prior (rate_density).
+        """
         z = float(row.get("wave_obs", np.nan)) / self.rest_wave - 1.0
         if not np.isfinite(z) or z <= 0:
             return -np.inf
@@ -113,12 +167,14 @@ class LAELabel(LabelModel):
             PPPConfig,
             skybox_solid_angle_sr,
             _compute_label_grids,
-            _rate_grid_per_sr,
-            integrate_rate_over_flux,
             expected_count_from_rate,
             expected_volume_from_dVdz,
             sample_z_indices,
             sample_F_given_z,
+        )
+        from jlc.core.population_helpers import (
+            rate_density_integrand_per_flux,
+            integrate_over_flux,
         )
         # Respect virtual mode: no physical sources
         try:
@@ -136,35 +192,38 @@ class LAELabel(LabelModel):
             return _pd.DataFrame(columns=["ra","dec","true_class","wave_obs","flux_true","flux_hat","flux_err"]).copy(), {
                 "label": self.label, "mu": 0.0, "V_Mpc3": 0.0
             }
-        rate, dVdz, dL2 = _rate_grid_per_sr(ctx, self.lf, ctx.selection, self.rest_wave, z_grid, F_grid, label_name=self.label)
-        r_z = integrate_rate_over_flux(rate, F_grid)  # per sr per dz
-        mu = expected_count_from_rate(r_z, z_grid, omega)
-        V = expected_volume_from_dVdz(dVdz, z_grid, omega)
-
-        # --- Diagnostics: compare expected count rate with population_helpers ---
+        # Compute rates using population_helpers in observed space (per sr per Å)
         lam_grid = self.rest_wave * (1.0 + z_grid)
+        Nz = z_grid.size
+        Nf = F_grid.size
+        r_lambda = _np.zeros(Nz, dtype=float)  # per sr per Å
+        dVdz = _np.zeros(Nz, dtype=float)
+        # Store per-z per-flux weights for sampling F|z (using r_F which is per sr per Å per flux)
+        rate = _np.zeros((Nz, Nf), dtype=float)
+        for i, z in enumerate(z_grid):
+            lam_i = float(lam_grid[i])
+            rF_i, dVdz_i, _dL2_i = rate_density_integrand_per_flux(
+                self.lf, ctx.selection, F_grid, lam_i, self.rest_wave, float(z), ctx.cosmo, label_name=self.label
+            )
+            rate[i, :] = _np.asarray(rF_i, dtype=float)
+            dVdz[i] = float(dVdz_i)
+            r_lambda[i] = float(integrate_over_flux(rF_i, F_grid))
+        # Expected counts across band and volume
+        mu_per_sr = float(_np.trapz(r_lambda, x=lam_grid))
+        mu = float(mu_per_sr * float(omega))
+        V = expected_volume_from_dVdz(dVdz, z_grid, omega)
+        # Build r(z) per sr per dz for z-sampling via r(z) = r(λ) / |dz/dλ| = r(λ) * rest_wave
+        r_z = r_lambda * float(self.rest_wave)
+        # --- Diagnostics: 50"×50" box summary
         dlam = float(lam_grid[-1] - lam_grid[0]) if lam_grid.size >= 2 else float("nan")
-        jac = 1.0 / float(self.rest_wave)  # |dz/dλ|
-        # Convert simulator path to per sr per Angstrom
-        r_lambda_from_z = r_z * jac  # per sr per Å
-
-        # Integrate over λ to get counts per sr across the band
-        mu_per_sr_from_z = float(np.trapz(r_lambda_from_z, x=lam_grid))
-        # Band-averaged per-Å rate densities (per sr per Å)
-        rbar_from_z = (mu_per_sr_from_z / dlam) if (np.isfinite(dlam) and dlam > 0) else float("nan")
-        # Convert to current sky area and to a 50"x50" box
-        mu_from_z_check = mu_per_sr_from_z * float(omega)
-        # 50 arcsec box solid angle (small-angle approx): (50" in rad)^2
-        arcsec_to_rad = np.deg2rad(1.0/3600.0)
+        rbar = (mu_per_sr / dlam) if (_np.isfinite(dlam) and dlam > 0) else float("nan")
+        arcsec_to_rad = _np.deg2rad(1.0/3600.0)
         side_rad = 50.0 * arcsec_to_rad
         omega_box = float(side_rad * side_rad)
-        mu_box_from_z = mu_per_sr_from_z * omega_box
-        rbar_box_from_z = rbar_from_z * omega_box
-        # Logs
-
+        mu_box = mu_per_sr * omega_box
+        rbar_box = rbar * omega_box
         log(
-            f"[lae.simulate_catalog] 50\"×50\" box (Ω_box≈{omega_box:.3e} sr): counts from_z={mu_box_from_z:.3e},; "
-            f"rates per Å in box: r̄_from_z={rbar_box_from_z:.3e}"
+            f"[lae.simulate_catalog] 50\"×50\" box (Ω_box≈{omega_box:.3e} sr): counts={mu_box:.3e}; rates per Å in box: r̄={rbar_box:.3e}"
         )
 
 

@@ -134,3 +134,25 @@ This section summarizes the core quantities in units you can check, and how they
 ## Citations
 - Jaynes, E. T. (2003), Probability Theory: The Logic of Science.
 - Standard Schechter LF parameterizations as configured in configs/priors; cosmology via astropy (Planck18).
+
+```mermaid
+flowchart LR
+
+    THETA[World Model Theta\nLFs, EW, fake, selection]
+
+    PREDICT["Predict observables\nFor each label l\np(d_i given l, Theta)"]
+
+    DATA[(Observed catalog d_i)]
+
+    LIKE["Catalog likelihood\nProduct over i of sum over l\np(d_i given l, Theta) p(l given Theta)"]
+
+    SAMPLE["Sample posterior\np(Theta given data)\nMCMC or Nested"]
+
+    PLABEL["Per source i:\nCompute p(l given d_i, Theta)\nover many Theta samples\nMean p_label + uncertainty"]
+
+    THETA --> PREDICT
+    PREDICT --> LIKE
+    DATA --> LIKE
+    LIKE --> SAMPLE
+    SAMPLE --> PLABEL
+```
