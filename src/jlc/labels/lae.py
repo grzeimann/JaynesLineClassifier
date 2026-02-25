@@ -173,7 +173,6 @@ class LAELabel(LabelModel):
             sample_F_given_z,
         )
         from jlc.core.population_helpers import (
-            rate_density_integrand_per_flux,
             integrate_over_flux,
         )
         # Respect virtual mode: no physical sources

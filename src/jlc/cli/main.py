@@ -22,6 +22,7 @@ from jlc.simulate.simple import SkyBox, plot_distributions, plot_selection_compl
 from jlc.simulate.field import simulate_field as simulate_field_api
 from jlc.utils.logging import log
 from jlc.priors import PriorRecord, load_prior_record, save_prior_record, apply_prior_to_label
+from jlc.engine_noise.noise_cube_model import NoiseCube, NoiseCubeModel
 
 # Named defaults to avoid magic numbers sprinkled around
 FLUXGRID_DEFAULT_MIN = 1e-18
@@ -262,6 +263,28 @@ def cmd_classify(args) -> int:
                     log(f"[jlc.classify] Warning: failed to load/apply prior '{pth}': {e}")
         except Exception as e:
             log(f"[jlc.classify] Warning: failed to process --load-prior '{lp}': {e}")
+    # If a noise cube is provided, attach it as the selection noise model (after registry/ctx creation; before engine)
+    try:
+        if getattr(args, "noise_cube", None):
+            cube_path = str(args.noise_cube)
+            default_sigma = float(getattr(args, "noise_default_sigma", 1.0) if getattr(args, "noise_default_sigma", None) is not None else 1.0)
+            cube = NoiseCube.from_fits(cube_path)
+            nm = NoiseCubeModel(cube, default_sigma=default_sigma)
+            try:
+                ctx.selection.set_noise_model(nm)
+            except Exception:
+                setattr(ctx.selection, "noise_model", nm)
+            try:
+                if isinstance(ctx.config, dict):
+                    ctx.config["noise_cube_path"] = cube_path
+                    ctx.config["noise_model"] = "NoiseCubeModel"
+            except Exception:
+                pass
+            log(f"[jlc.classify] Loaded noise cube from {cube_path} with default_sigma={default_sigma}")
+    except Exception as e:
+        log(f"[jlc.classify] Error: failed to load --noise-cube '{getattr(args, 'noise_cube', None)}': {e}")
+        return 2
+
     # Apply prior toggles to context config
     try:
         if isinstance(ctx.config, dict):
@@ -386,6 +409,34 @@ def cmd_simulate(args) -> int:
                 ctx.config["flux_err_sim"] = float(args.flux_err)
     except Exception:
         pass
+
+    # If a noise cube is provided, attach it as the selection noise model (after ctx build; before simulate)
+    try:
+        if getattr(args, "noise_cube", None):
+            cube_path = str(args.noise_cube)
+            # Determine default sigma: --noise-default-sigma > --flux-err > 1.0
+            if getattr(args, "noise_default_sigma", None) is not None:
+                default_sigma = float(args.noise_default_sigma)
+            elif getattr(args, "flux_err", None) is not None:
+                default_sigma = float(args.flux_err)
+            else:
+                default_sigma = 1.0
+            cube = NoiseCube.from_fits(cube_path)
+            nm = NoiseCubeModel(cube, default_sigma=default_sigma)
+            try:
+                ctx.selection.set_noise_model(nm)
+            except Exception:
+                setattr(ctx.selection, "noise_model", nm)
+            try:
+                if isinstance(ctx.config, dict):
+                    ctx.config["noise_cube_path"] = cube_path
+                    ctx.config["noise_model"] = "NoiseCubeModel"
+            except Exception:
+                pass
+            log(f"[jlc.simulate] Loaded noise cube from {cube_path} with default_sigma={default_sigma}")
+    except Exception as e:
+        log(f"[jlc.simulate] Error: failed to load --noise-cube '{getattr(args, 'noise_cube', None)}': {e}")
+        return 2
 
     # Ensure selection NoiseModel default_sigma follows --flux-err unless explicitly overridden later
     try:
@@ -651,6 +702,8 @@ def main(argv=None):
     p_classify.add_argument("--save-prior-dir", dest="save_prior_dir", default=None, help="Directory to save per-label PriorRecord snapshots after classification")
     # Factorized selection toggle
     p_classify.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors")
+    p_classify.add_argument("--noise-cube", dest="noise_cube", default=None, help="Path to a 3D FITS noise cube (RA,Dec,λ) to use as the noise model; enables S/N-based selection if SN models are provided")
+    p_classify.add_argument("--noise-default-sigma", dest="noise_default_sigma", type=float, default=1.0, help="Fallback σ used when sky position is missing (only when --noise-cube is provided)")
     p_classify.set_defaults(func=cmd_classify)
 
     p_classify.add_argument("--fluxgrid-window-sigma", dest="fluxgrid_window_sigma", type=float, default=None, help="If set, restrict per-row flux integration to [F_hat ± k·σ] with k=sigma; speeds up evidence and rate integrations")
@@ -704,6 +757,8 @@ def main(argv=None):
     p_sim.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors during simulate/classify run")
     # Timing detail diagnostics
     p_sim.add_argument("--timing-detail", dest="timing_detail", action="store_true", help="Emit detailed timing diagnostics including average per-row FluxGrid size actually used")
+    p_sim.add_argument("--noise-cube", dest="noise_cube", default=None, help="Path to a 3D FITS noise cube (RA,Dec,λ) to use as the noise model during simulate/classify")
+    p_sim.add_argument("--noise-default-sigma", dest="noise_default_sigma", type=float, default=None, help="Fallback σ when sky position is missing (overrides --flux-err for default sigma if set)")
     p_sim.set_defaults(func=cmd_simulate)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
