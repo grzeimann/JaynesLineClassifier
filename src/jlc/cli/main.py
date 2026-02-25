@@ -1,5 +1,6 @@
 import argparse
 import sys
+import time
 import numpy as np
 import pandas as pd
 from jlc.utils.constants import EPS_LOG, THRESH_FACTOR_LOW, THRESH_FACTOR_HIGH, FLUX_MIN_FLOOR
@@ -17,7 +18,7 @@ from jlc.selection.base import SelectionModel
 from jlc.selection import build_selection_model_from_priors
 from jlc.measurements.flux import FluxMeasurement
 from jlc.measurements.wavelength import WavelengthMeasurement
-from jlc.simulate.simple import SkyBox, plot_distributions, plot_selection_completeness
+from jlc.simulate.simple import SkyBox, plot_distributions, plot_selection_completeness, plot_label_distribution_comparison, plot_probability_circle
 from jlc.simulate.field import simulate_field as simulate_field_api
 from jlc.utils.logging import log
 from jlc.priors import PriorRecord, load_prior_record, save_prior_record, apply_prior_to_label
@@ -30,7 +31,8 @@ FLUXGRID_DEFAULT_N = 128
 def build_default_context_and_registry(wave_min: float | None = None, wave_max: float | None = None, volume_mode: str | None = None,
                                         n_fibers: int | None = None, ifu_count: int | None = None, exposure_scale: float | None = None,
                                         search_measure_scale: float | None = None,
-                                        fluxgrid_min: float | None = None, fluxgrid_max: float | None = None, fluxgrid_n: int | None = None):
+                                        fluxgrid_min: float | None = None, fluxgrid_max: float | None = None, fluxgrid_n: int | None = None,
+                                        fluxgrid_window_sigma: float | None = None, fluxgrid_window_min_n: int | None = None):
     # Context with simple caches
     cosmo = AstropyCosmology()
     selection = SelectionModel()
@@ -39,8 +41,10 @@ def build_default_context_and_registry(wave_min: float | None = None, wave_max: 
     fg_Fmin = FLUXGRID_DEFAULT_MIN if fluxgrid_min is None else float(fluxgrid_min)
     fg_Fmax = FLUXGRID_DEFAULT_MAX if fluxgrid_max is None else float(fluxgrid_max)
     fg_n = FLUXGRID_DEFAULT_N if fluxgrid_n is None else int(fluxgrid_n)
-    # Build FluxGrid
-    _fg = FluxGrid(Fmin=fg_Fmin, Fmax=fg_Fmax, n=fg_n)
+    # Build FluxGrid (with optional per-row windowing)
+    win_sigma = None if fluxgrid_window_sigma is None else float(fluxgrid_window_sigma)
+    win_min_n = 16 if fluxgrid_window_min_n is None else int(fluxgrid_window_min_n)
+    _fg = FluxGrid(Fmin=fg_Fmin, Fmax=fg_Fmax, n=fg_n, window_sigma=win_sigma, window_min_n=win_min_n)
     caches = {
         "flux_grid": _fg,
     }
@@ -55,6 +59,9 @@ def build_default_context_and_registry(wave_min: float | None = None, wave_max: 
     config["fluxgrid_min"] = float(fg_Fmin)
     config["fluxgrid_max"] = float(fg_Fmax)
     config["fluxgrid_n"] = int(fg_n)
+    if win_sigma is not None:
+        config["fluxgrid_window_sigma"] = float(win_sigma)
+        config["fluxgrid_window_min_n"] = int(win_min_n)
     # effective_search_measure knobs
     if n_fibers is not None:
         config["n_fibers"] = int(n_fibers)
@@ -228,6 +235,8 @@ def cmd_classify(args) -> int:
         fluxgrid_min=getattr(args, "fluxgrid_min", None),
         fluxgrid_max=getattr(args, "fluxgrid_max", None),
         fluxgrid_n=getattr(args, "fluxgrid_n", None),
+        fluxgrid_window_sigma=getattr(args, "fluxgrid_window_sigma", None),
+        fluxgrid_window_min_n=getattr(args, "fluxgrid_window_min_n", None),
     )
     # Optionally load and apply a PriorRecord
     if getattr(args, "load_prior", None):
@@ -336,6 +345,8 @@ def cmd_simulate(args) -> int:
         fluxgrid_min=getattr(args, "fluxgrid_min", None),
         fluxgrid_max=getattr(args, "fluxgrid_max", None),
         fluxgrid_n=getattr(args, "fluxgrid_n", None),
+        fluxgrid_window_sigma=getattr(args, "fluxgrid_window_sigma", None),
+        fluxgrid_window_min_n=getattr(args, "fluxgrid_window_min_n", None),
     )
 
     # Optionally load and apply a PriorRecord
@@ -416,6 +427,7 @@ def cmd_simulate(args) -> int:
         pass
 
     log("[jlc.simulate] Using engine-aligned simulate_field() API (new architecture source of truth)")
+    tp = time.perf_counter()
     df = simulate_field_api(
         registry=registry,
         ctx=ctx,
@@ -431,6 +443,8 @@ def cmd_simulate(args) -> int:
         nz=args.nz,
         snr_min=getattr(args, "snr_min", None),
     )
+    t_sim_end = time.perf_counter()
+    sim_time = t_sim_end - tp
 
 
     # Save simulated catalog
@@ -438,11 +452,51 @@ def cmd_simulate(args) -> int:
         df.to_csv(args.out_catalog, index=False)
 
     # Classify using the same context/registry (PPP path reuses them)
+    # If detailed timing is requested, reset FluxGrid stats so averages reflect only this classify stage
+    if bool(getattr(args, "timing_detail", False)):
+        try:
+            fg = getattr(getattr(ctx, "caches", {}), "get", lambda k, d=None: None)("flux_grid") if hasattr(getattr(ctx, "caches", {}), "get") else getattr(getattr(ctx, "caches", None), "flux_grid", None)
+            if fg is not None and hasattr(fg, "reset_stats"):
+                fg.reset_stats()
+        except Exception:
+            pass
+    t0 = time.perf_counter()
     engine = JaynesianEngine(registry, ctx)
+    t1 = time.perf_counter()
     out = engine.compute_extra_log_likelihood_matrix(df)
+    t2 = time.perf_counter()
     out = engine.normalize_posteriors(out)
+    t3 = time.perf_counter()
+    wrote = False
     if args.out_classified:
         out.to_csv(args.out_classified, index=False)
+        wrote = True
+    t4 = time.perf_counter()
+    try:
+        n_rows = len(df) if df is not None else 0
+        log(
+            f"[jlc.simulate.timing] simulation={t0 - tp:.3f}s, engine_init={t1 - t0:.3f}s, compute_logZ={t2 - t1:.3f}s, normalize={t3 - t2:.3f}s, write_csv={(t4 - t3) if wrote else 0.0:.3f}s, total={t4 - t0:.3f}s for N={n_rows} rows"
+        )
+        # Optional timing detail: average per-row FluxGrid size actually used
+        if bool(getattr(args, "timing_detail", False)):
+            try:
+                fg = getattr(getattr(ctx, "caches", {}), "get", lambda k, d=None: None)("flux_grid") if hasattr(getattr(ctx, "caches", {}), "get") else getattr(getattr(ctx, "caches", None), "flux_grid", None)
+                if fg is not None:
+                    calls = int(getattr(fg, "stats_calls", 0) or 0)
+                    pts = int(getattr(fg, "stats_points_total", 0) or 0)
+                    avg = (pts / calls) if calls > 0 else float("nan")
+                    base_n = getattr(fg, 'n', None)
+                    frac = (avg / base_n * 100.0) if (base_n and base_n > 0 and np.isfinite(avg)) else float('nan')
+                    win_sigma = getattr(fg, "window_sigma", None)
+                    win_min_n = getattr(fg, "window_min_n", None)
+                    if np.isfinite(frac):
+                        log(f"[jlc.simulate.timing] FluxGrid window k={win_sigma}, min_n={win_min_n}; avg_used_points={avg:.1f} over {calls} calls (base_n={base_n}, {frac:.1f}% of base)")
+                    else:
+                        log(f"[jlc.simulate.timing] FluxGrid window k={win_sigma}, min_n={win_min_n}; avg_used_points={avg:.1f} over {calls} calls (base_n={base_n})")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Optionally compute and save LFs
     if getattr(args, "out_lf_observed", None) or getattr(args, "out_lf_inferred", None) or getattr(args, "lf_plot_prefix", None):
@@ -536,6 +590,18 @@ def cmd_simulate(args) -> int:
             plot_selection_completeness(ctx.selection, args.plot_prefix)
         except Exception as e:
             log(f"[jlc.simulate] Warning: failed to plot selection completeness: {e}")
+        # New: input vs posterior-weighted distribution comparison per label
+        try:
+            if out is not None and not out.empty:
+                plot_label_distribution_comparison(df_input=df, df_inferred=out, prefix=args.plot_prefix)
+        except Exception as e:
+            log(f"[jlc.simulate] Warning: failed to plot input vs posterior-weighted comparison: {e}")
+        # New: probability circle plot using posterior columns p_<label>
+        try:
+            if out is not None and not out.empty:
+                plot_probability_circle(df_inferred=out, prefix=args.plot_prefix)
+        except Exception as e:
+            log(f"[jlc.simulate] Warning: failed to plot probability circle: {e}")
     # Optionally save per-label PriorRecord snapshots
     if getattr(args, "save_prior_dir", None):
         import os
@@ -587,6 +653,11 @@ def main(argv=None):
     p_classify.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors")
     p_classify.set_defaults(func=cmd_classify)
 
+    p_classify.add_argument("--fluxgrid-window-sigma", dest="fluxgrid_window_sigma", type=float, default=None, help="If set, restrict per-row flux integration to [F_hat ± k·σ] with k=sigma; speeds up evidence and rate integrations")
+    p_classify.add_argument("--fluxgrid-window-min-n", dest="fluxgrid_window_min_n", type=int, default=16, help="Minimum number of flux grid points to keep when windowing is active")
+    # Timing detail diagnostics
+    p_classify.add_argument("--timing-detail", dest="timing_detail", action="store_true", help="Emit detailed timing diagnostics including average per-row FluxGrid size actually used")
+
     p_sim = sub.add_parser("simulate", help="Generate a mock catalog and classify")
     p_sim.add_argument("--n", type=int, default=1000, help="Number of sources to simulate")
     p_sim.add_argument("--ra-low", dest="ra_low", type=float, default=0.0)
@@ -615,6 +686,8 @@ def main(argv=None):
     p_sim.add_argument("--fluxgrid-min", dest="fluxgrid_min", type=float, default=None, help="Minimum flux for FluxGrid (default 1e-18 if unset)")
     p_sim.add_argument("--fluxgrid-max", dest="fluxgrid_max", type=float, default=None, help="Maximum flux for FluxGrid (default 1e-14 if unset)")
     p_sim.add_argument("--fluxgrid-n", dest="fluxgrid_n", type=int, default=None, help="Number of flux grid points (default 128 if unset)")
+    p_sim.add_argument("--fluxgrid-window-sigma", dest="fluxgrid_window_sigma", type=float, default=5.0, help="Restrict per-row flux integration to [F_hat ± k·σ] with k=sigma; speeds up evidence and rate computations (default 5.0)")
+    p_sim.add_argument("--fluxgrid-window-min-n", dest="fluxgrid_window_min_n", type=int, default=16, help="Minimum number of flux grid points to keep when windowing is active (default 16)")
     # Luminosity Function outputs
     p_sim.add_argument("--lf-nz", dest="lf_nz", type=int, default=2048, help="Redshift grid size for V_eff(L) integration in LF binning (default 2048)")
     p_sim.add_argument("--out-lf-observed", dest="out_lf_observed", default=None, help="CSV to write binned observed LF (LAE/OII) using true_class membership")
@@ -629,6 +702,8 @@ def main(argv=None):
     p_sim.add_argument("--save-prior-dir", dest="save_prior_dir", default=None, help="Directory to save per-label PriorRecord snapshots after simulation/classification")
     # Factorized selection toggle for simulate as well
     p_sim.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors during simulate/classify run")
+    # Timing detail diagnostics
+    p_sim.add_argument("--timing-detail", dest="timing_detail", action="store_true", help="Emit detailed timing diagnostics including average per-row FluxGrid size actually used")
     p_sim.set_defaults(func=cmd_simulate)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])

@@ -284,7 +284,6 @@ class JaynesianEngine:
         # Compute per-row, per-label rate densities and add as diagnostics
         rates = np.zeros((len(out), len(labels)), dtype=float)
 
-        # First pass: compute label rates and (optionally) record fake components
         for i, (_, row) in enumerate(out.iterrows()):
             for j, L in enumerate(labels):
                 model = self.registry.model(L)
@@ -294,27 +293,47 @@ class JaynesianEngine:
                     r = 1.0
                 rates[i, j] = max(r, 0.0)
 
-
         # Evidence matrix (log)
         logZ = np.vstack([out.get(f"logZ_{L}", np.full(len(out), -np.inf)) for L in labels]).T  # (N, K)
 
-        # Apply mode and rate prior toggles
+        # Mode control: decide which components to include
+        cfg = getattr(self.ctx, "config", {}) or {}
+        effective_mode = (mode or cfg.get("engine_mode") or "rate_times_likelihood").lower()
+        use_rates = True
+        use_evid = True
+        if effective_mode == "rate_only":
+            use_evid = False
+        elif effective_mode == "likelihood_only":
+            use_rates = False
+        # Convert rates to log space (guard zeros)
         with np.errstate(divide='ignore'):
             logR = np.log(rates + EPS_LOG)
-
-        # else combined: keep both
+        # Possibly zero-out components per mode
+        if not use_rates:
+            logR = np.zeros_like(logR)
+        if not use_evid:
+            logZ = np.zeros_like(logZ)
 
         # Emit per-label rate diagnostics
         for j, L in enumerate(labels):
             out[f"rate_{L}"] = rates[:, j]
 
+        # Start with sum of enabled components
         logP_unnorm = logZ + logR
 
-        # log-softmax
+        # Apply global prior weights if requested and provided
+        try:
+            use_global = bool(cfg.get("use_global_priors", False))
+        except Exception:
+            use_global = False
+        if use_global and isinstance(log_prior_weights, dict) and len(log_prior_weights) > 0:
+            prior_vec = np.array([float(log_prior_weights.get(L, 0.0)) for L in labels], dtype=float)
+            logP_unnorm = logP_unnorm + prior_vec[None, :]
+
+        # log-softmax to get probabilities
         m = np.max(logP_unnorm, axis=1, keepdims=True)
         P = np.exp(logP_unnorm - m)
         denom = np.sum(P, axis=1, keepdims=True)
-        # Avoid division by zero if all -inf
         denom = np.where(denom <= 0, 1.0, denom)
         P = P / denom
 
@@ -326,7 +345,6 @@ class JaynesianEngine:
             j_fake = labels.index("fake")
             rate_fake = rates[:, j_fake]
             rate_phys = np.sum(rates, axis=1) - rate_fake
-            # Avoid division by zero
             prior_odds = np.where(rate_fake > 0, rate_phys / np.maximum(rate_fake, EPS_LOG), np.nan)
             out["rate_fake_total"] = rate_fake
             out["rate_phys_total"] = rate_phys
@@ -334,10 +352,8 @@ class JaynesianEngine:
         else:
             out["rate_phys_total"] = np.sum(rates, axis=1)
 
-
         # If a calibrated/used fake rate is present in context, record it for traceability
         try:
-            cfg = getattr(self.ctx, "config", {}) or {}
             rho = cfg.get("fake_rate_rho_used", cfg.get("fake_rate_per_sr_per_A", None))
             if rho is not None:
                 out["rho_used"] = float(rho)

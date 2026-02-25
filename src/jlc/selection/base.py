@@ -39,7 +39,6 @@ class SNCompletenessModel(ABC):
     def completeness(self, sn_true: float, wave_true: float, latent: Dict[str, Any]) -> float:  # pragma: no cover - interface
         raise NotImplementedError
 
-
 @dataclass
 class SNLogisticPerLambdaBin(SNCompletenessModel):
     """Logistic S/N completeness with wavelength-bin dependence.

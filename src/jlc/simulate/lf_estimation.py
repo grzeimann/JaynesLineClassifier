@@ -458,7 +458,7 @@ def plot_binned_lf(
             # Axis limits tied to knee if available
             if np.isfinite(log10phistar):
                 ylo = 10 ** (log10phistar - 2.5)
-                yhi = 10 ** (log10phistar + 1.5)
+                yhi = 10 ** (log10phistar + 2.5)
                 ax.set_ylim(ylo, yhi)
             ax.set_xlim(xlo, xhi)
         # Labels/scales
