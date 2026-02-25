@@ -41,7 +41,7 @@ class SNCompletenessModel(ABC):
 
 @dataclass
 class SNLogisticPerLambdaBin(SNCompletenessModel):
-    """Logistic S/N completeness with wavelength-bin dependence.
+    """Logistic (technically tanh, but close enough) S/N completeness with wavelength-bin dependence.
 
     C = 0.5 * (1 + tanh((S/N_true - sn50_j)/width_j)) for λ in bin j.
     """

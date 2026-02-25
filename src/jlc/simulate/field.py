@@ -45,24 +45,23 @@ def simulate_field(
     except Exception:
         pass
 
-    # Align selection noise model's default sigma with the simulation flux_err
+    # Align selection noise model's default sigma with the simulation flux_err, but
+    # only if the selection already has an S/N completeness model configured. This
+    # preserves historical behavior S≡1 when no S/N model is present.
     try:
         sel = getattr(ctx, "selection", None)
-        if sel is not None and getattr(sel, "noise_model", None) is not None:
+        if sel is not None:
+            has_sn_models = False
             try:
-                sel.noise_model.default_sigma = float(flux_err)
+                has_sn_models = bool(getattr(sel, "_sn_models", {}))
             except Exception:
-                pass
-        elif sel is not None:
-            # Attach a simple flat NoiseModel if missing
-            try:
-                from jlc.selection.base import NoiseModel
-                if hasattr(sel, "set_noise_model"):
-                    sel.set_noise_model(NoiseModel(default_sigma=float(flux_err)))
-                else:
-                    setattr(sel, "noise_model", NoiseModel(default_sigma=float(flux_err)))
-            except Exception:
-                pass
+                has_sn_models = False
+            if has_sn_models and getattr(sel, "noise_model", None) is not None:
+                try:
+                    sel.noise_model.default_sigma = float(flux_err)
+                except Exception:
+                    pass
+            # Do not auto-attach a NoiseModel if none exists and there are no SN models.
     except Exception:
         pass
 

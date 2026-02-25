@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 jlc = "jlc.cli.main:main"
+noise-cube = "jlc.engine_noise.noise_cube_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
