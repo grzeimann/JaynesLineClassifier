@@ -373,6 +373,7 @@ def cmd_simulate(args) -> int:
     )
 
     # Optionally load and apply a PriorRecord
+    applied_prior_records = []
     if getattr(args, "load_prior", None):
         # Accept either a single YAML path or a directory containing multiple prior YAMLs
         lp = args.load_prior
@@ -391,7 +392,13 @@ def cmd_simulate(args) -> int:
                 try:
                     rec = load_prior_record(pth)
                     _apply_prior_record_to_runtime(rec, registry, ctx)
+                    applied_prior_records.append(rec)
                     log(f"[jlc.simulate] Loaded prior record '{rec.name}' (scope={rec.scope}, label={rec.label}) from {pth}")
+                    # Capture also to context for downstream (optional)
+                    try:
+                        ctx.caches.setdefault("applied_prior_records", []).append(rec)
+                    except Exception:
+                        pass
                 except Exception as e:
                     log(f"[jlc.simulate] Warning: failed to load/apply prior '{pth}': {e}")
         except Exception as e:
@@ -434,6 +441,127 @@ def cmd_simulate(args) -> int:
             except Exception:
                 pass
             log(f"[jlc.simulate] Loaded noise cube from {cube_path} with default_sigma={default_sigma}")
+            # Experimental pipeline: run if enabled
+            if bool(getattr(args, "sim_pipeline_experimental", False)):
+                try:
+                    from jlc.simulate import NoiseCubeReader as _NCR, build_noise_histogram as _bnh, run_simulation as _run_sim, write_experimental_plots as _wep
+                    # Build noise bin edges from cube statistics (log-spaced) if not provided via config
+                    import numpy as _np
+                    nz = _np.asarray(cube.noise, dtype=float)
+                    if cube.mask is not None:
+                        nz = _np.where(_np.asarray(cube.mask, dtype=bool), _np.nan, nz)
+                    valid = _np.isfinite(nz) & (nz > 0)
+                    if not _np.any(valid):
+                        raise RuntimeError("Noise cube has no positive finite voxels to build histogram edges")
+                    v = nz[valid]
+                    nmin = float(_np.nanpercentile(v, 0.1))
+                    nmax = float(_np.nanpercentile(v, 99.9))
+                    n_bins = 16
+                    log('The noise cube contains {0} voxels with values in [{1:.2e}, {2:.2e}] covered with {3} bins'.format(len(v), nmin, nmax, n_bins))
+                    e = _np.logspace(_np.log10(nmin), _np.log10(nmax), n_bins + 1)
+                    reader = _NCR(cube)
+                    # Enable completeness tracing if requested
+                    try:
+                        from jlc.simulate.diagnostics import enable_completeness_tracing as _en_ct
+                        _en_ct(bool(getattr(args, "completeness_debug", False)) or bool(getattr(args, "timing_detail", False)))
+                    except Exception:
+                        pass
+                    nh = _bnh(reader, e, enable_mem=bool(getattr(args, "timing_detail", False)))
+                    # Flux grid for simulation from context FluxGrid settings
+                    fg = ctx.caches.get("flux_grid")
+                    if fg is not None:
+                        F_true_grid = _np.logspace(_np.log10(fg.Fmin), _np.log10(fg.Fmax), int(fg.n))
+                    else:
+                        F_true_grid = _np.logspace(-18, -14, 128)
+                    # Build LF mapping from registry (include labels that expose phi())
+                    lf_by_label = {}
+                    try:
+                        for L in registry.labels:
+                            m = registry.model(L)
+                            if hasattr(m, "lf"):
+                                lf_by_label[str(L)] = getattr(m, "lf")
+                    except Exception:
+                        pass
+                    if len(lf_by_label) == 0:
+                        log("[jlc.simulate] Warning: no LF models found in registry; experimental pipeline will produce no sources")
+                    rng = _np.random.default_rng(int(getattr(args, "seed", 12345)))
+                    # Build per-label line profiles from applied priors (if available)
+                    profile_by_label = None
+                    try:
+                        from jlc.simulate import build_profile_from_prior as _bpfp
+                        pmap = {}
+                        # Prefer explicitly applied_prior_records list; else try registry labels' snapshots if available
+                        for rec in applied_prior_records or []:
+                            if getattr(rec, "scope", None) == "label" and getattr(rec, "label", None):
+                                prof = _bpfp(rec)
+                                if prof is not None:
+                                    pmap[str(rec.label)] = prof
+                        if len(pmap) > 0:
+                            profile_by_label = pmap
+                    except Exception:
+                        profile_by_label = None
+
+                    rec = _run_sim(
+                        cube_reader=reader,
+                        noise_hist=nh,
+                        noise_bin_edges=e,
+                        lf_by_label=lf_by_label,
+                        F_true_grid=F_true_grid,
+                        selection=ctx.selection,
+                        rng=rng,
+                        enable_mem=bool(getattr(args, "timing_detail", False)),
+                        include_debug=bool(getattr(args, "timing_detail", False)) or bool(getattr(args, "completeness_debug", False)),
+                        profile_by_label=profile_by_label,
+                    )
+                    # Write to CSV
+                    try:
+                        import pandas as _pd
+                        df_sim = _pd.DataFrame.from_records(rec)
+                        out_path = getattr(args, "out_catalog", "sim_catalog.csv")
+                        df_sim.to_csv(out_path, index=False)
+                        log(f"[jlc.simulate] Experimental pipeline wrote {len(df_sim)} rows to {out_path}")
+                        # Optional: write plots like default sim mode
+                        pp = getattr(args, "plot_prefix", None)
+                        if pp:
+                            try:
+                                _wep(prefix=str(pp), df_sim=df_sim, selection=ctx.selection, noise_hist=nh, F_true_grid=F_true_grid)
+                            except Exception as __e:
+                                log(f"[jlc.simulate] Warning: failed to write experimental plots: {__e}")
+                        # Optionally classify the experimental catalog via Engine
+                        if bool(getattr(args, "classify_after_experimental", False)):
+                            try:
+                                # Map experimental schema to engine input
+                                df_in = _pd.DataFrame()
+                                df_in["wave_obs"] = df_sim.get("lambda", _np.array([], dtype=float)).astype(float, copy=False)
+                                df_in["flux_hat"] = df_sim.get("F_fit", _np.array([], dtype=float)).astype(float, copy=False)
+                                df_in["flux_err"] = df_sim.get("F_error", _np.array([], dtype=float)).astype(float, copy=False)
+                                # Carry true_class for comparison plots
+                                if "label" in df_sim.columns:
+                                    df_in["true_class"] = df_sim["label"].astype(str)
+                                # Run Engine with existing ctx/registry
+                                engine = JaynesianEngine(registry, ctx)
+                                df_post = engine.compute_extra_log_likelihood_matrix(df_in)
+                                df_post = engine.normalize_posteriors(df_post)
+                                outc = getattr(args, "out_classified", "sim_classified.csv")
+                                df_post.to_csv(outc, index=False)
+                                log(f"[jlc.simulate] Experimental classification wrote {len(df_post)} rows to {outc}")
+                                # Posterior-based plots for parity (do not overwrite experimental compare/circle)
+                                if pp:
+                                    try:
+                                        # Use posterior-weighted comparison and probability circle
+                                        plot_label_distribution_comparison(df_in, df_post, prefix=str(pp) + "_post", labels=None, use_hard=False)
+                                        plot_probability_circle(df_post, prefix=str(pp) + "_post")
+                                    except Exception as __pe:
+                                        log(f"[jlc.simulate] Warning: failed to write posterior plots: {__pe}")
+                            except Exception as __ce:
+                                log(f"[jlc.simulate] Warning: classify-after-experimental failed: {__ce}")
+                    except Exception as _e:
+                        log(f"[jlc.simulate] Warning: failed to write experimental catalog: {_e}")
+                    # Do not proceed to default simulate/classify path in experimental mode
+                    return 0
+                except Exception as _e:
+                    log(f"[jlc.simulate] Error in experimental simulation pipeline: {_e}")
+                    return 2
     except Exception as e:
         log(f"[jlc.simulate] Error: failed to load --noise-cube '{getattr(args, 'noise_cube', None)}': {e}")
         return 2
@@ -726,6 +854,8 @@ def main(argv=None):
     p_sim.add_argument("--calibrate-fake-rate-from", dest="calibrate_fake_rate_from", default=None, help="CSV of virtual detections to estimate a homogeneous fake rate ρ; uses current sky box and wavelength band")
     p_sim.add_argument("--nz", dest="nz", type=int, default=256, help="Number of redshift grid points for PPP mode")
     p_sim.add_argument("--volume-mode", dest="volume_mode", choices=["real", "virtual"], default="real", help="Volume mode: real (default) or virtual (no physical sources)")
+    # Experimental pipeline toggle (no behavior change by default)
+    p_sim.add_argument("--sim-pipeline-experimental", dest="sim_pipeline_experimental", action="store_true", help="Enable experimental simulation pipeline scaffolding (developer feature)")
     # effective_search_measure knobs
     p_sim.add_argument("--n-fibers", dest="n_fibers", type=int, default=None, help="Number of fibers contributing to search (multiplier)")
     p_sim.add_argument("--ifu-count", dest="ifu_count", type=int, default=None, help="Number of IFUs contributing (multiplier)")
@@ -757,8 +887,11 @@ def main(argv=None):
     p_sim.add_argument("--use-factorized-selection", dest="use_factorized_selection", action="store_true", help="Enable factorized per-measurement selection multiplier in rate priors during simulate/classify run")
     # Timing detail diagnostics
     p_sim.add_argument("--timing-detail", dest="timing_detail", action="store_true", help="Emit detailed timing diagnostics including average per-row FluxGrid size actually used")
+    p_sim.add_argument("--completeness-debug", dest="completeness_debug", action="store_true", help="Trace completeness behavior (counts, exceptions, degeneracy) in experimental pipeline")
     p_sim.add_argument("--noise-cube", dest="noise_cube", default=None, help="Path to a 3D FITS noise cube (RA,Dec,λ) to use as the noise model during simulate/classify")
     p_sim.add_argument("--noise-default-sigma", dest="noise_default_sigma", type=float, default=None, help="Fallback σ when sky position is missing (overrides --flux-err for default sigma if set)")
+    # Experimental: optionally classify the simulated catalog via Engine after generation
+    p_sim.add_argument("--classify-after-experimental", dest="classify_after_experimental", action="store_true", help="When using --sim-pipeline-experimental, also run the Engine to classify the simulated catalog and write --out-classified and comparison/circle plots")
     p_sim.set_defaults(func=cmd_simulate)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])

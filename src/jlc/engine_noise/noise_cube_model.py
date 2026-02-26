@@ -57,7 +57,7 @@ class NoiseCube:
 
         with fits.open(path, memmap=True) as hdul:
             phdu = hdul[0]
-            data = np.asarray(phdu.data)
+            data = np.asarray(phdu.data) * 3e-17
             if data is None:
                 raise ValueError(f"Primary HDU has no data in {path}")
             hdr = phdu.header
@@ -93,20 +93,74 @@ class NoiseCube:
             dec = build_grid(n_axes[dec_ax], crvals[dec_ax], crpixs[dec_ax], cdeltas[dec_ax])
             wave = build_grid(n_axes[wave_ax], crvals[wave_ax], crpixs[wave_ax], cdeltas[wave_ax])
 
+            # Axis-aware test cropping (developer convenience):
+            # Reduce cube size while keeping real data. Cropping is applied
+            # along the identified RA/DEC/WAVE axes regardless of their order
+            # in the FITS data array. Guards ensure we only crop when large enough.
             # FITS axis order to numpy axis order for a 3D image: (3,2,1) -> (0,1,2)
             # Map FITS axis indices 0/1/2 to numpy axes 2/1/0 respectively
             fits_to_numpy = {0: 2, 1: 1, 2: 0}
-            current_axes = [fits_to_numpy[ra_ax], fits_to_numpy[dec_ax], fits_to_numpy[wave_ax]]
+            ra_np = fits_to_numpy[ra_ax]
+            dec_np = fits_to_numpy[dec_ax]
+            wave_np = fits_to_numpy[wave_ax]
+
+            # Build per-axis crop slices in FITS header axis space (convert to numpy axes for data)
+            def compute_crop(n: int, start: int, stop: int) -> tuple[int | None, int | None]:
+                # Return (start, stop) bounded within [0, n]; if not large enough, return (None, None)
+                if n <= 0:
+                    return (None, None)
+                s = start if n > stop else None
+                e = min(stop, n) if n > stop else None
+                if s is not None and e is not None and e > s:
+                    return (s, e)
+                return (None, None)
+
+            # Desired developer crops
+            ra_s, ra_e = compute_crop(n_axes[ra_ax], 800, 1200)
+            dec_s, dec_e = compute_crop(n_axes[dec_ax], 800, 1200)
+            # For wavelength, crop 50 from start and 40 from end if long enough (> 90)
+            if n_axes[wave_ax] > 90:
+                wave_s, wave_e = (50, max(50, n_axes[wave_ax] - 40))
+            else:
+                wave_s, wave_e = (None, None)
+
+            # Apply to 1D grids
+            if ra_s is not None:
+                ra = ra[ra_s:ra_e]
+            if dec_s is not None:
+                dec = dec[dec_s:dec_e]
+            if wave_s is not None and wave_e is not None and wave_e > wave_s:
+                wave = wave[wave_s:wave_e]
+
+            # Apply to 3D data using numpy axis indices
+            np_slices = [slice(None), slice(None), slice(None)]
+            if ra_s is not None:
+                np_slices[ra_np] = slice(ra_s, ra_e)
+            if dec_s is not None:
+                np_slices[dec_np] = slice(dec_s, dec_e)
+            if wave_s is not None and wave_e is not None and wave_e > wave_s:
+                np_slices[wave_np] = slice(wave_s, wave_e)
+            data = data[tuple(np_slices)]
+
+            current_axes = [ra_np, dec_np, wave_np]
             perm = tuple(current_axes)
 
             # Reorder the primary data so that resulting array axes are (RA, DEC, WAVE)
             noise = np.transpose(data, axes=perm)
 
-            # Optional MASK extension: transpose to the same ordering
+            # Optional MASK extension: apply same crop and transpose to the same ordering
             mask = None
             if 'MASK' in hdul:
                 raw_mask = np.asarray(hdul['MASK'].data)
                 if raw_mask is not None and raw_mask.ndim == 3:
+                    m_slices = [slice(None), slice(None), slice(None)]
+                    if ra_s is not None:
+                        m_slices[ra_np] = slice(ra_s, ra_e)
+                    if dec_s is not None:
+                        m_slices[dec_np] = slice(dec_s, dec_e)
+                    if wave_s is not None and wave_e is not None and wave_e > wave_s:
+                        m_slices[wave_np] = slice(wave_s, wave_e)
+                    raw_mask = raw_mask[tuple(m_slices)]
                     mask = np.transpose(raw_mask, axes=perm).astype(bool)
 
         cube = cls(noise=noise, ra_grid=np.asarray(ra), dec_grid=np.asarray(dec), wave_grid=np.asarray(wave), mask=mask)

@@ -65,3 +65,52 @@ jlc simulate --from-model \
 ```
 
 Or load a precomputed cache directly with `--fake-lambda-cache-in fake_lambda_shape.npz`.
+
+---
+
+## 5. Experimental simulation with a FITS noise cube
+
+Developer feature for end‑to‑end simulations driven by a 3D FITS noise cube. Produces a simulated catalog and optional plots; can also classify the simulated catalog.
+
+Minimal smoke test:
+
+```bash
+jlc simulate \
+  --sim-pipeline-experimental \
+  --noise-cube "/path/to/VDFI_COSMOS_errorcube.fits" \
+  --out-catalog cosmos_sim_catalog.csv \
+  --seed 12345
+```
+
+Recommended (load priors so LFs are available, pin a flux grid, write plots):
+
+```bash
+jlc simulate \
+  --sim-pipeline-experimental \
+  --noise-cube "/path/to/VDFI_COSMOS_errorcube.fits" \
+  --load-prior configs/priors \
+  --fluxgrid-min 1e-18 --fluxgrid-max 1e-14 --fluxgrid-n 128 \
+  --out-catalog cosmos_sim_catalog.csv \
+  --plot-prefix cosmos_sim \
+  --seed 20260226
+```
+
+Optional: classify the experimental catalog via the Engine and write posterior plots:
+
+```bash
+jlc simulate \
+  --sim-pipeline-experimental \
+  --noise-cube "/path/to/VDFI_COSMOS_errorcube.fits" \
+  --load-prior configs/priors \
+  --fluxgrid-min 1e-18 --fluxgrid-max 1e-14 --fluxgrid-n 128 \
+  --out-catalog cosmos_sim_catalog.csv \
+  --out-classified cosmos_sim_classified.csv \
+  --plot-prefix cosmos_sim \
+  --classify-after-experimental \
+  --seed 20260226
+```
+
+Notes
+- Provide `--timing-detail` to enable detailed progress and memory diagnostics.
+- When `--plot-prefix` is supplied, the experimental path writes: `<prefix>_wave.png`, `<prefix>_flux.png`, `<prefix>_<label>.png`, `<prefix>_compare.png`, `<prefix>_circle.png`, and `<prefix>_selection.png`.
+- See SIMULATION_PIPELINE.md for architecture and design details.

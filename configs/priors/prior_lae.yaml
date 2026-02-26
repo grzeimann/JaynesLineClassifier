@@ -16,6 +16,12 @@ hyperparams:
         type: "gaussian"
         params:
           extra_scatter: 0.0
+      profile:
+        type: "skew_gaussian"
+        params:
+          sigma_A: 2.0
+          gain: 1.0
+          skew: 0.2
     wavelength:
       prior:
         type: "deterministic-from-z"
@@ -28,5 +34,5 @@ hyperparams:
       model: "logistic_per_lambda_bin"
       params:
         bins_wave: [3600, 4500, 5400]
-        sn50: [5.0, 5.0]
-        width: [0.9, 0.9]
+        sn50: [6.0, 6.0]
+        width: [1.5, 1.5]

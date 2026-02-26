@@ -27,6 +27,37 @@ The output CSV will include, for each configured label (default: lae, oii, fake)
 Columns in the simulated catalog (both modes):
 - ra, dec, true_class, wave_obs, flux_hat, flux_err, snr (if --snr-min provided, only rows with snr >= threshold are kept)
 
+## Quickstart: Experimental simulation with a FITS noise cube (VDFI example)
+This project includes an experimental end-to-end simulation path that consumes a 3D FITS noise cube (RA, Dec, λ) to generate a mock catalog. By default it writes a CSV to --out-catalog and exits (it does not run the standard classify step in experimental mode). Optionally, you can ask it to classify the simulated catalog via the Engine using --classify-after-experimental.
+
+- Minimal (smoke test)
+
+```
+jlc simulate \
+  --sim-pipeline-experimental \
+  --noise-cube "/Users/grz85/work/VDFI/VDFI_COSMOS_errorcube.fits" \
+  --out-catalog cosmos_sim_catalog.csv \
+  --seed 12345
+```
+
+- Recommended (load bundled priors so LFs are available, and pin a flux grid)
+
+```
+jlc simulate \
+  --sim-pipeline-experimental \
+  --noise-cube "/Users/grz85/work/VDFI/VDFI_COSMOS_errorcube.fits" \
+  --load-prior configs/priors \
+  --fluxgrid-min 1e-18 --fluxgrid-max 1e-14 --fluxgrid-n 128 \
+  --out-catalog cosmos_sim_catalog.csv \
+  --seed 20260226
+```
+
+Notes
+- The experimental path auto-derives noise bins from the cube and writes only the simulated catalog to --out-catalog (default sim_catalog.csv). It then returns without running the default classify stage.
+- --noise-default-sigma is used only as a fallback when a position lacks a cube value; in this pipeline positions are sampled from valid spaxels, so you usually don’t need to set it.
+- You can tweak expected counts via the priors (Schechter LFs) you load with --load-prior and via effective search measure knobs you may have in your selection model (if present in your priors/config).
+- For design notes see SIMULATION_PIPELINE.md and NOISE_HISTOGRAM.md.
+
 ---
 
 ## Why Jaynes? A short motivation
