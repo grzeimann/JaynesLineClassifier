@@ -187,3 +187,138 @@ flowchart LR
     LIKE --> SAMPLE
     SAMPLE --> PLABEL
 ```
+
+```mermaid
+flowchart TD
+
+%% ========= LAYER 0: PRIORS / HYPERPARAMETERS =========
+subgraph G0[Hyperparameters & Priors]
+    XI[Global hyperparams\nΞ]
+    TH_LAE[LAE hyperparams\nΘ_LAE]
+    TH_OII[OII hyperparams\nΘ_OII]
+    TH_OTHER[Other-line hyperparams\nΘ_other]
+    TH_FAKE[Fake-source hyperparams\nΘ_fake]
+    W_LAE[Template weights\nw_LAEj]
+    W_OII[Template weights\nw_OIIj]
+    W_OTHER[Template weights\nw_otherj]
+end
+
+%% ========= LAYER 1: POPULATION / PHYSICS =========
+subgraph G1[Physics / Population Layer]
+    POP_LAE[LAE PPP in (F_true,z,x)\nintensity from Θ_LAE]
+    POP_OII[OII PPP in (F_true,z,x)\nintensity from Θ_OII]
+    POP_OTHER[Other-line PPP]
+end
+
+XI --> TH_LAE
+XI --> TH_OII
+XI --> TH_OTHER
+XI --> TH_FAKE
+
+TH_LAE --> POP_LAE
+TH_OII --> POP_OII
+TH_OTHER --> POP_OTHER
+
+TH_LAE --> W_LAE
+TH_OII --> W_OII
+TH_OTHER --> W_OTHER
+
+%% ========= LAYER 2: TEMPLATE LAYER =========
+subgraph G2[Template Layer (Spectral + Spatial)]
+    T_LAEJ[LAE templates t_LAE,j\n(line + spatial)]
+    T_OIIJ[OII templates t_OII,j\n(line + spatial)]
+    T_OTHERJ[Other-line templates t_other,j]
+end
+
+W_LAE --> T_LAEJ
+W_OII --> T_OIIJ
+W_OTHER --> T_OTHERJ
+
+%% ========= LAYER 3: NOISE & INSTRUMENT =========
+subgraph G3[Noise & Instrument Layer]
+    NOISEC[Noise model per context c\nC(c)]
+    HDET[Detection filter h\n(single Gaussian-ish)]
+    TFIT[Measurement template t_fit]
+end
+
+XI --> NOISEC
+
+%% ========= LAYER 4: SELECTION & TRANSFER (ANALYTIC) =========
+subgraph G4[Selection & Transfer Layer (Analytic)]
+    ETA[η_ℓj(c) =\n(h^T C⁻¹ t_ℓj)/sqrt(h^T C⁻¹ h)]
+    BETA[β_ℓj(c) =\n(t_fit^T C⁻¹ t_ℓj)/(t_fit^T C⁻¹ t_fit)]
+    SIGF[σ_F²(c) = 1/(t_fit^T C⁻¹ t_fit)]
+    CSEL[Selection function\nC_ℓ(F_true,c)]
+    TRANSF[Transfer function\np(F_fit | F_true,ℓ,j,c)]
+end
+
+NOISEC --> ETA
+NOISEC --> BETA
+NOISEC --> SIGF
+T_LAEJ --> ETA
+T_OIIJ --> ETA
+T_OTHERJ --> ETA
+T_LAEJ --> BETA
+T_OIIJ --> BETA
+T_OTHERJ --> BETA
+HDET --> ETA
+TFIT --> BETA
+TFIT --> SIGF
+
+ETA --> CSEL
+ETA --> TRANSF
+BETA --> TRANSF
+SIGF --> TRANSF
+W_LAE --> CSEL
+W_OII --> CSEL
+W_OTHER --> CSEL
+W_LAE --> TRANSF
+W_OII --> TRANSF
+W_OTHER --> TRANSF
+
+%% ========= LAYER 5: CATALOG GENERATION =========
+subgraph G5[Catalog Space]
+    TRUEPOP[True sources\n(ℓ, j, F_true, λ, x)]
+    DETSTAT[S detection stats\nper location]
+    CAT[Catalog entries\n(S, F_fit, σ_F, λ, spatial, context c)]
+end
+
+POP_LAE --> TRUEPOP
+POP_OII --> TRUEPOP
+POP_OTHER --> TRUEPOP
+
+TRUEPOP --> DETSTAT
+NOISEC --> DETSTAT
+HDET --> DETSTAT
+
+CSEL --> CAT
+TRANSF --> CAT
+DETSTAT --> CAT
+
+%% ========= LAYER 6: WORLD MODEL & INFERENCE =========
+subgraph G6[World Model & Inference]
+    LIK[p(catalog | Θ, Θ_fake)\nusing C_ℓ and transfer]
+    LABELPOST[Label & flux posteriors\np(ℓ_k, j_k, F_true,k | catalog, Θ)]
+    POSTTH[Posterior over hyperparams\np(Θ_ℓ, w_ℓ, Θ_fake | catalog)]
+end
+
+CAT --> LIK
+TH_LAE --> LIK
+TH_OII --> LIK
+TH_OTHER --> LIK
+TH_FAKE --> LIK
+W_LAE --> LIK
+W_OII --> LIK
+W_OTHER --> LIK
+
+LIK --> LABELPOST
+LIK --> POSTTH
+
+POSTTH --> TH_LAE
+POSTTH --> TH_OII
+POSTTH --> TH_OTHER
+POSTTH --> TH_FAKE
+POSTTH --> W_LAE
+POSTTH --> W_OII
+POSTTH --> W_OTHER
+```
