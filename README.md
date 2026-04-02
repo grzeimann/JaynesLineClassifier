@@ -1,6 +1,24 @@
 # JaynesLineClassifier
 
-A Jaynesian inference engine for labeling emission-line candidates by combining spectral measurements, selection models, cosmology + luminosity‑function (LF) priors, and observed‑space rate densities. The design follows E. T. Jaynes’ program: state what you know (priors), what you measured (likelihoods), and then update beliefs by the rules of probability—nothing more, nothing less.
+JaynesLineClassifier is a probabilistic modeling framework for classifying
+spectral emission-line detections in noisy observational datasets. The goal
+is to infer the most probable physical origin of each detected line by
+combining measured spectral properties with prior knowledge about the
+underlying population and observational selection effects.
+
+The model integrates spectral measurements, survey selection functions,
+cosmology, and luminosity-function (LF) priors to estimate the relative
+probability that a detected feature corresponds to different emission-line
+sources. Rather than treating detections in isolation, the framework
+connects individual observations to population-level constraints and
+observed-space rate densities.
+
+The design follows E. T. Jaynes’ program: state what you know (priors),
+what you measured (likelihoods), and update beliefs by the rules of
+probability—nothing more, nothing less. In this sense the classifier is
+not a heuristic labeling tool, but a generative inference engine that
+links observations, survey physics, and population models in a coherent
+Bayesian framework.
 
 ## Install (Conda only)
 
